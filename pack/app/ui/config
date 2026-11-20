@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "pmops.main": {
+      "title": "物业工程管理",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/pmops",
+      "gatewaySocket": "app.sock",
+      "url": "/app/pmops",
+      "allUsers": true
+    }
+  }
+}

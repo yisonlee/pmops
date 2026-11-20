@@ -1,0 +1,134 @@
+#!/bin/bash
+# 物业工程管理 - 运行控制脚本
+# 启动 Node.js 服务，监听统一网关 Unix Socket
+
+LOG_FILE="${TRIM_PKGVAR}/app.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+
+export PATH=/var/apps/nodejs_v22/target/bin:$PATH
+
+APP_DIR="${TRIM_APPDEST}/server"
+SOCKET_PATH="${TRIM_APPDEST}/app.sock"
+WWW_DIR="${TRIM_APPDEST}/www"
+
+# 数据目录：优先使用 data-share 声明的共享目录（用户可在文件管理器中看到数据库文件）
+DATA_DIR="${TRIM_PKGVAR}"
+if [ -n "${TRIM_DATA_SHARE_PATHS}" ]; then
+  FIRST_SHARE="${TRIM_DATA_SHARE_PATHS%%:*}"
+  if [ -d "${FIRST_SHARE}" ]; then
+    DATA_DIR="${FIRST_SHARE}"
+  fi
+fi
+
+log_msg() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+check_process() {
+  local pid="$1"
+  kill -0 "$pid" 2>/dev/null
+}
+
+status_app() {
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+    if [ -n "$pid" ] && check_process "$pid"; then
+      return 0
+    fi
+    rm -f "$PID_FILE"
+  fi
+  return 1
+}
+
+# 检测 node:sqlite 支持情况，选择合适的启动参数
+detect_node_flags() {
+  if node -e "require('node:sqlite')" >/dev/null 2>&1; then
+    echo ""
+  elif node --experimental-sqlite -e "require('node:sqlite')" >/dev/null 2>&1; then
+    echo "--experimental-sqlite"
+  else
+    # 完全不支持时由应用内自动降级为 JSON 文件存储
+    echo ""
+  fi
+}
+
+start_app() {
+  if status_app; then
+    return 0
+  fi
+
+  log_msg "Starting pmops..."
+  mkdir -p "$DATA_DIR"
+
+  local NODE_FLAGS
+  NODE_FLAGS="$(detect_node_flags)"
+
+  cd "$APP_DIR" || exit 1
+  GATEWAY_PREFIX="/app/pmops" \
+  SOCKET_PATH="$SOCKET_PATH" \
+  LAN_PORT="${PMOPS_LAN_PORT:-3340}" \
+  DATA_DIR="$DATA_DIR" \
+  WWW_DIR="$WWW_DIR" \
+  node $NODE_FLAGS server.js >> "$LOG_FILE" 2>&1 &
+  echo "$!" > "$PID_FILE"
+
+  # 等待 Socket 就绪
+  local count=0
+  while [ ! -S "$SOCKET_PATH" ] && [ "$count" -lt 15 ]; do
+    sleep 1
+    count=$((count + 1))
+  done
+  log_msg "Started (pid=$(cat "$PID_FILE"), socket_ready=$([ -S "$SOCKET_PATH" ] && echo yes || echo no), lan_port=${PMOPS_LAN_PORT:-3340}, data_dir=$DATA_DIR)"
+}
+
+stop_app() {
+  log_msg "Stopping pmops..."
+
+  if [ ! -f "$PID_FILE" ]; then
+    return 0
+  fi
+
+  local pid
+  pid="$(head -n 1 "$PID_FILE" | tr -d '[:space:]')"
+
+  if [ -z "$pid" ] || ! check_process "$pid"; then
+    rm -f "$PID_FILE"
+    return 0
+  fi
+
+  kill -TERM "$pid" 2>> "$LOG_FILE" || true
+
+  local count=0
+  while check_process "$pid" && [ "$count" -lt 10 ]; do
+    sleep 1
+    count=$((count + 1))
+  done
+
+  if check_process "$pid"; then
+    kill -KILL "$pid" 2>> "$LOG_FILE"
+  fi
+
+  rm -f "$PID_FILE"
+  rm -f "$SOCKET_PATH"
+  log_msg "Stopped."
+}
+
+case "$1" in
+  start)
+    start_app
+    ;;
+  stop)
+    stop_app
+    ;;
+  status)
+    if status_app; then
+      exit 0
+    fi
+    exit 3
+    ;;
+  *)
+    echo "Unknown command: $1" > "$TRIM_TEMP_LOGFILE"
+    exit 1
+    ;;
+esac

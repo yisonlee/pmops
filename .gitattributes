@@ -1,0 +1,7 @@
+# fnOS 上的 shell 脚本与前端资源必须保持 LF，避免 CRLF 破坏 #!/bin/bash
+* text=auto eol=lf
+
+# 二进制资源不做任何转换
+*.fpk binary
+*.png binary
+*.PNG binary

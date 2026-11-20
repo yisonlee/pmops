@@ -1,0 +1,24 @@
+# 忽略本地运行、回归测试与预览渲染产生的临时产物
+
+# 本地 SQLite 数据 / 附件目录
+.tmpdata/
+.tmpdata-*/
+.tmpdata-v*/
+.verify-*/
+
+# 回归测试输出与解压校验目录
+tests/*.txt
+download/
+*.log
+
+# 各版本 UI 预览页（由 tests/render-*.js 生成，体积较大）
+preview-*.html
+
+# 根目录的临时打包产物；发布包只保留 dist/ 下带版本号的 fpk
+/*.fpk
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

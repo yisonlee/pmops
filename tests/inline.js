@@ -1,0 +1,6405 @@
+
+"use strict";
+/* ============================================================
+   基础工具
+   ============================================================ */
+const API_BASE = (() => {
+  const p = location.pathname;
+  if (p.indexOf('/app/pmops') === 0) return '/app/pmops/api';
+  return 'api';
+})();
+
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const money = (n) => '¥' + (Number(n) || 0).toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+const moneyShort = (n) => {
+  n = Number(n) || 0;
+  if (Math.abs(n) >= 10000) return '¥' + (n / 10000).toFixed(n % 10000 === 0 ? 0 : 1) + '万';
+  return money(n);
+};
+const num = (n) => (Number(n) || 0).toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+/* ---------- 列表搜索与欠费统计（各模块共用） ---------- */
+/** 关键词是否命中任意字段；空关键词不过滤 */
+function matchQuery(q, vals) {
+  const s = String(q == null ? '' : q).trim().toLowerCase();
+  if (!s) return true;
+  return vals.some(v => String(v == null ? '' : v).toLowerCase().includes(s));
+}
+/** 与商铺「搜索商铺 / 租户」一致的工具栏搜索框 */
+function searchBox(id, placeholder, value) {
+  return `<div class="search" style="margin-left:auto">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+      <input id="${id}" placeholder="${esc(placeholder)}" value="${esc(value || '')}">
+    </div>`;
+}
+/** 商铺欠费合计：所有未收款账单总额（卡片 / 筛选 / 统计栏共用） */
+function shopUnpaid(id) {
+  return (S.data && S.data.bills ? S.data.bills : [])
+    .filter(b => b.shop_id === Number(id) && b.status !== 'paid')
+    .reduce((n, b) => n + (Number(b.total) || 0), 0);
+}
+// 日期一律按本地时区格式化，避免 toISOString 在 UTC+8 凌晨回退一天
+const fmtDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const today = () => fmtDate(new Date());
+const thisMonth = () => today().slice(0, 7);
+const addDays = (dateStr, days) => {
+  const p = String(dateStr || '').split('-').map(Number);
+  const base = (p.length === 3 && p[0] && p[1] && p[2]) ? new Date(p[0], p[1] - 1, p[2]) : new Date();
+  base.setDate(base.getDate() + (Number(days) || 0));
+  return fmtDate(base);
+};
+/** 设备保养预警：已过计划日期，或已进入设置里的提前天数窗口；本轮已完成则不再提醒 */
+const maintainWarn = (e) => {
+  if (!e || !e.next_maintain || e.status === 'stopped' || e.maintain_status === 'done') return false;
+  return e.next_maintain <= addDays(today(), Number((S.settings || {}).maintain_remind_days) || 0);
+};
+const maintainLate = (e) => !!e.next_maintain && e.next_maintain < today();
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+
+/* 1.17.0：概览与可视化面板合并为唯一的「可视化驾驶舱」模块。
+   overview / cockpit 作为旧书签与旧本地记忆的兼容别名，统一落到 dashboard。 */
+const COCKPIT_VIEW = 'dashboard';
+const LEGACY_VIEW_ALIAS = { overview: COCKPIT_VIEW, cockpit: COCKPIT_VIEW };
+/** 视图归一化：旧别名、空值与非法值一律落到驾驶舱；其它业务模块保持原样 */
+function normalizeView(v) {
+  const raw = String(v == null ? '' : v).trim();
+  const key = LEGACY_VIEW_ALIAS[raw] || raw;
+  return TITLES[key] ? key : COCKPIT_VIEW;
+}
+
+const CAT = {
+  aircon: '空调', fire: '消防', electric: '强电', weak: '弱电', plumbing: '给排水',
+  elevator: '电梯', kitchen: '厨房设备', other: '其他'
+};
+const CAT_COLOR = {
+  aircon: '#2563eb', fire: '#dc2626', electric: '#d97706', weak: '#7c3aed', plumbing: '#0891b2',
+  elevator: '#0284c7', kitchen: '#ea580c', other: '#64748b'
+};
+const SHOP_STATUS = { rented: ['在租', 'ok'], vacant: ['空置', 'muted'], maintenance: ['维修', 'warn'] };
+const EQ_STATUS = { normal: ['正常', 'ok'], repair: ['维修中', 'danger'], stopped: ['停用', 'muted'] };
+/* 1.26.0：楼栋台账状态与子页定义 */
+const BUILDING_STATUS = { active: ['启用', 'ok'], inactive: ['停用', 'muted'] };
+const SHOP_TABS = [{ k: 'shops', n: '商铺列表' }, { k: 'buildings', n: '楼栋管理' }];
+
+/* 1.18.0：商铺装修 / 维修状态与进度（两条业务线独立，最新一条进度回算状态） */
+const SHOP_WORK_TYPES = { decoration: '装修', repair: '维修' };
+const SHOP_WORK_STATUS = {
+  none: ['未开始', 'muted'], planned: ['待开工', 'warn'], doing: ['进行中', 'info'],
+  done: ['已完成', 'ok'], paused: ['已暂停', 'danger']
+};
+const SHOP_WORK_OPTIONS = Object.keys(SHOP_WORK_STATUS).map(k => ({ k, n: SHOP_WORK_STATUS[k][0] }));
+const shopWorkStatus = (s, type) => String((s && s[type === 'repair' ? 'repair_status' : 'decoration_status']) || 'none');
+const shopWorkProgress = (s, type) => clamp(Number((s && s[type === 'repair' ? 'repair_progress' : 'decoration_progress']) || 0), 0, 100);
+/* 1.19.0：统计栏只保留唯一「维修」类目 —— 经营业态为维修，或维修工程正在进行中（并集去重） */
+const shopRepairScope = (s) => !!s && (s.status === 'maintenance' || shopWorkStatus(s, 'repair') === 'doing');
+const SHOP_STATUS_KEYS = ['all', 'rented', 'vacant', 'maintenance', 'decorating', 'arrears'];
+const normalizeShopStatus = (k) => k === 'repairing' ? 'maintenance'
+  : SHOP_STATUS_KEYS.indexOf(k) >= 0 ? k : 'all';
+const shopWorkLogs = (shopId, type) => (S.data && S.data.shop_progress_logs ? S.data.shop_progress_logs : [])
+  .filter(l => l.shop_id === Number(shopId) && l.type === type)
+  .sort((a, b) => String(b.log_date || '').localeCompare(String(a.log_date || '')) || (b.id - a.id));
+function shopWorkPill(s, type) {
+  const k = shopWorkStatus(s, type);
+  return `<span class="pill ${(SHOP_WORK_STATUS[k] || SHOP_WORK_STATUS.none)[1]}">${esc((SHOP_WORK_STATUS[k] || SHOP_WORK_STATUS.none)[0])}</span>`;
+}
+function workBar(pct) {
+  const p = clamp(Number(pct) || 0, 0, 100);
+  const tone = p >= 100 ? 'green' : p > 0 ? '' : 'amber';
+  return `<div class="work-bar"><div class="bar ${tone}"><i style="width:${p}%"></i></div><b>${p}%</b></div>`;
+}
+
+/* 1.18.0：档案管理 */
+const ARCHIVE_CAT = {
+  contract: '合同档案', drawing: '图纸资料', license: '证照文件', acceptance: '验收资料',
+  equipment: '设备资料', shop: '商铺资料', other: '其他'
+};
+const ARCHIVE_STATUS = {
+  filed: ['在档', 'ok'], borrowed: ['借出', 'warn'], sealed: ['已封存', 'muted'], void: ['已作废', 'danger']
+};
+const ARCHIVE_SECURITY = { normal: '普通', internal: '内部', secret: '机密' };
+const ARCHIVE_ENTITY = {
+  shops: '商铺', contracts: '工程合同', equipments: '设备', archives: '档案', warehouse_items: '仓库物料'
+};
+const ARCHIVE_LOG_TYPE = { borrow: '借阅', return: '归还' };
+const ARCHIVE_CAT_OPTIONS = Object.keys(ARCHIVE_CAT).map(k => ({ k, n: ARCHIVE_CAT[k] }));
+const ARCHIVE_STATUS_OPTIONS = Object.keys(ARCHIVE_STATUS).map(k => ({ k, n: ARCHIVE_STATUS[k][0] }));
+
+/* 1.18.0：仓库管理 */
+const WH_CAT = {
+  tool: '工具', hardware: '五金', electric: '电气', fire: '消防',
+  cleaning: '清洁用品', consumable: '耗材', spare: '备品备件', other: '其他'
+};
+const WH_CAT_COLOR = {
+  tool: '#2563eb', hardware: '#d97706', electric: '#7c3aed', fire: '#dc2626',
+  cleaning: '#0891b2', consumable: '#059669', spare: '#ea580c', other: '#64748b'
+};
+const WH_ITEM_STATUS = { normal: ['正常', 'ok'], stopped: ['停用', 'muted'] };
+const WH_RECORD_TYPE = { in: ['入库', 'ok'], out: ['出库', 'warn'], adjust: ['盘点调整', 'info'] };
+const WH_CAT_OPTIONS = Object.keys(WH_CAT).map(k => ({ k, n: WH_CAT[k] }));
+const whLowStock = (i) => i.status !== 'stopped' && (Number(i.quantity) || 0) <= (Number(i.min_stock) || 0);
+const whRecords = (itemId) => (S.data && S.data.warehouse_records ? S.data.warehouse_records : [])
+  .filter(r => r.item_id === Number(itemId))
+  .sort((a, b) => String(b.log_date || '').localeCompare(String(a.log_date || '')) || (b.id - a.id));
+
+/* 1.15.0：保养状态（维保记录与设备共用）；设备 maintain_status 为空 = 按下次保养日期自动派生 */
+const EQ_LOG_TYPES = { inspect: '巡检', maintain: '保养', repair: '维修' };
+const MAINTAIN_STATUS = {
+  planned: ['待保养', 'warn'], doing: ['保养中', 'info'],
+  done: ['已完成', 'ok'], postponed: ['已延期', 'danger']
+};
+const MAINTAIN_OPTIONS = Object.keys(MAINTAIN_STATUS).map(k => ({ k, n: MAINTAIN_STATUS[k][0] }));
+function eqMaintainInfo(e) {
+  const m = String((e && e.maintain_status) || '').trim();
+  if (m && MAINTAIN_STATUS[m]) return { key: m, label: MAINTAIN_STATUS[m][0], tone: MAINTAIN_STATUS[m][1], manual: true };
+  if (!e || e.status === 'stopped') return { key: 'normal', label: '停用免保养', tone: 'muted', manual: false };
+  if (maintainLate(e)) return { key: 'planned', label: '保养已到期', tone: 'danger', manual: false };
+  if (maintainWarn(e)) return { key: 'planned', label: '待保养', tone: 'warn', manual: false };
+  return { key: 'normal', label: '状态正常', tone: 'ok', manual: false };
+}
+const eqMaintainKey = (e) => eqMaintainInfo(e).key;
+function eqMaintainPill(e) {
+  const i = eqMaintainInfo(e);
+  return `<span class="pill ${i.tone}" title="${i.manual ? '手动设定的保养状态' : '按下次保养日期自动判断'}">${esc(i.label)}${i.manual ? ' · 手动' : ''}</span>`;
+}
+function logMaintainPill(l) {
+  const s = MAINTAIN_STATUS[String((l && l.maintain_status) || 'done')] || MAINTAIN_STATUS.done;
+  return `<span class="pill ${s[1]}">${esc(s[0])}</span>`;
+}
+
+const CONTRACT_STATUS = { draft: ['草拟', 'muted'], ongoing: ['施工中', 'info'], paused: ['暂停', 'warn'], done: ['已完工', 'ok'], settled: ['已结算', 'violet'] };
+const PLAN_STATUS = { pending: ['未到期', 'muted'], due: ['待支付', 'warn'], paid: ['已支付', 'ok'] };
+const CATEGORY_CONTRACT = { renovation: '改造', repair: '维修', new: '新建' };
+
+const pill = (map, key) => {
+  const item = map[key] || ['未知', 'muted'];
+  return `<span class="pill ${item[1]}"><span class="dot"></span>${esc(item[0])}</span>`;
+};
+
+/* ============================================================
+   显示模式（列表 / 方块）
+   ============================================================ */
+const ICON_LIST = 'M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01';
+const ICON_GRID = 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z';
+
+const defaultMode = () => ((S.settings || {}).default_mode === 'card' ? 'card' : 'list');
+const modeOf = (v) => (S.mode[v] === 'card' || S.mode[v] === 'list') ? S.mode[v] : defaultMode();
+function setMode(v, m) {
+  S.mode[v] = m === 'card' ? 'card' : 'list';
+  try { localStorage.setItem('pmops_view_mode', JSON.stringify(S.mode)); } catch (e) {}
+}
+function segHtml(v) {
+  const m = modeOf(v);
+  return `<div class="seg" title="切换显示方式">
+      <button class="${m === 'list' ? 'active' : ''}" data-act="mode" data-view="${v}" data-mode="list">
+        <svg viewBox="0 0 24 24"><path d="${ICON_LIST}"/></svg>列表</button>
+      <button class="${m === 'card' ? 'active' : ''}" data-act="mode" data-view="${v}" data-mode="card">
+        <svg viewBox="0 0 24 24"><path d="${ICON_GRID}"/></svg>方块</button>
+    </div>`;
+}
+
+/* ============================================================
+   附件（图片 / 扫描件）
+   ============================================================ */
+const ATT_ACCEPT = 'image/*,.pdf,.doc,.docx,.docm,.dot,.dotx,.rtf,.odt,.xls,.xlsx,.xlsm,.xlsb,.ods,.csv,.tsv,.ppt,.pptx,.pptm,.pps,.ppsx,.odp,.txt,.xml,.md,.zip,.rar';
+const MAX_UPLOAD_MB = 25;
+/* 1.19.0：档案支持 CAD / 工程图纸，且单个文件不限制大小 */
+const CAD_EXTS = ['.dwg', '.dxf', '.dwf', '.dwt', '.dws', '.dxb', '.rvt', '.rfa', '.rft',
+  '.skp', '.stp', '.step', '.igs', '.iges', '.sat', '.stl', '.obj', '.3ds',
+  '.plt', '.hpgl', '.ifc', '.svg', '.tif', '.tiff', '.7z', '.csv'];
+const ATT_ACCEPT_ARCHIVE = ATT_ACCEPT + ',' + CAD_EXTS.join(',');
+const isCadFile = (name) => CAD_EXTS.indexOf('.' + extOf(name).toLowerCase()) >= 0;
+const attachAccept = (entity) => (entity === 'archives' || entity === 'buildings') ? ATT_ACCEPT_ARCHIVE : ATT_ACCEPT;
+const attachHint = (entity) => {
+  const base = entity === 'archives'
+    ? '支持 CAD 图纸（DWG / DXF / RVT / SKP 等）与常见文档，单个文件大小不限'
+    : entity === 'buildings'
+      ? '支持楼栋平面图 / CAD 图纸（DWG / DXF 等）、验收资料与常见文档'
+      : `支持图片、PDF、Word / Excel / PPT，单个 ≤ ${MAX_UPLOAD_MB}MB`;
+  return base + (ooReady()
+    ? '；PDF / 表格走内置预览，Word / PPT / 旧版 xls 点开即由 OnlyOffice 在线打开'
+    : '；PDF / 表格可点击预览');
+};
+
+/* 1.22.0：点击附件即可在线预览 PDF 与表格（xlsx / xlsm / csv / tsv）及纯文本 */
+const PREVIEW_EXT = {
+  pdf: ['.pdf'],
+  table: ['.xlsx', '.xlsm', '.csv', '.tsv'],
+  text: ['.txt', '.log', '.json', '.xml', '.md']
+};
+/* 1.24.0：OnlyOffice 可渲染的 Office 格式；与服务端 OO_EXT_TYPES 保持一致 */
+const OO_OFFICE_EXTS = new Set([
+  '.doc', '.docx', '.docm', '.dot', '.dotx', '.dotm', '.rtf', '.odt', '.ott', '.fodt',
+  '.xls', '.xlsx', '.xlsm', '.xlsb', '.ods', '.ots', '.fods', '.csv',
+  '.ppt', '.pptx', '.pptm', '.pps', '.ppsx', '.ppsm', '.pot', '.potx', '.odp', '.otp', '.fodp'
+]);
+/** 只有「启用 + 填了 Document Server 地址」才切到 OnlyOffice，否则完全保持内置预览行为 */
+const ooReady = () => !!(S.settings && S.settings.oo_enabled === '1' && S.settings.oo_server);
+const ooSupports = (a) => ooReady() && OO_OFFICE_EXTS.has(attExtLower(a));
+const attExtLower = (a) => '.' + extOf(a && a.name).toLowerCase();
+
+/** 内置（零依赖）预览能力，不受 OnlyOffice 配置影响 */
+function attBuiltinKind(a) {
+  if (!a) return 'other';
+  if (isImg(a)) return 'image';
+  const e = attExtLower(a);
+  if (PREVIEW_EXT.pdf.indexOf(e) >= 0 || /\/pdf$/.test(a.mime || '')) return 'pdf';
+  if (PREVIEW_EXT.table.indexOf(e) >= 0) return 'table';
+  if (PREVIEW_EXT.text.indexOf(e) >= 0) return 'text';
+  if (e === '.xls') return 'xls';
+  return 'other';
+}
+/** 内置能看的仍走内置；原本看不了的 Office 文档（Word / PPT / 旧 xls）交给 OnlyOffice */
+function attPreviewKind(a) {
+  const k = attBuiltinKind(a);
+  if (k !== 'other' && k !== 'xls') return k;
+  if (ooSupports(a)) return 'office';
+  return k;
+}
+const attPreviewable = (a) => ['image', 'pdf', 'table', 'text', 'office'].indexOf(attPreviewKind(a)) >= 0;
+function attPreviewTag(a) {
+  const k = attPreviewKind(a);
+  if (k === 'pdf') return '<span class="att-preview-tag">PDF 预览</span>';
+  if (k === 'table') return '<span class="att-preview-tag">表格预览</span>';
+  if (k === 'text') return '<span class="att-preview-tag">文本预览</span>';
+  if (k === 'office') return '<span class="att-preview-tag" style="background:#7c3aed">Office 预览</span>';
+  return '';
+}
+
+const attsOf = (entity, id) => (S.data.attachments || [])
+  .filter(a => a.entity === entity && a.entity_id === Number(id))
+  .sort((a, b) => a.id - b.id);
+const attUrl = (a, dl) => `${API_BASE}/attachments/${a.id}/raw${dl ? '?download=1' : ''}`;
+const isImg = (a) => /^image\//.test(a.mime || '');
+const extOf = (name) => ((String(name || '').match(/\.([A-Za-z0-9]{1,8})$/) || [0, 'FILE'])[1]).toUpperCase();
+const sizeText = (n) => {
+  n = Number(n) || 0;
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  return Math.max(1, Math.round(n / 1024)) + ' KB';
+};
+
+/** 卡片上的缩略图条：最多 max 张，超出显示 +N */
+function thumbsHtml(entity, id, max) {
+  const list = attsOf(entity, id);
+  if (!list.length) return '';
+  const n = max || 3;
+  const shown = list.slice(0, n);
+  return `<div class="thumbs" data-att-thumbs="1" data-entity="${esc(entity)}" data-id="${id}" data-max="${n}">${shown.map(a => `
+      <div class="thumb" data-act="viewAtt" data-id="${a.id}" title="${attPreviewable(a) ? '点击预览：' : ''}${esc(a.name)}">
+        ${isImg(a) ? `<img src="${attUrl(a)}" alt="${esc(a.name)}" loading="lazy">` : `<span class="ext">${esc(extOf(a.name))}</span>`}
+        ${attPreviewTag(a)}
+      </div>`).join('')}${list.length > n ? `<div class="thumb more" data-act="attList" data-entity="${entity}" data-id="${id}">+${list.length - n}</div>` : ''}</div>`;
+}
+
+/** 1.23.0：详情弹窗的附件展示区（缩略图条 + 空态占位），上传 / 删除后可原地同步 */
+function attGalleryHtml(entity, id, max, empty) {
+  const n = Number(max) || 3;
+  const text = empty || '暂无图片 / 附件';
+  const list = attsOf(entity, id);
+  return `<div class="att-gallery" data-entity="${esc(entity)}" data-id="${id}" data-max="${n}" data-empty="${esc(text)}">
+    ${list.length ? thumbsHtml(entity, id, n) : `<div class="thumbs-none">${esc(text)}</div>`}
+  </div>`;
+}
+
+/** 附件面板：列表 + 上传按钮（用于表单与详情弹窗） */
+function attachPanelHtml(entity, id, opt) {
+  opt = opt || {};
+  const list = id ? attsOf(entity, id) : [];
+  const upload = id
+    ? `<label class="btn btn-sm upload-btn">＋ 上传图片 / 附件
+         <input type="file" multiple accept="${attachAccept(entity)}" data-attach-input></label>
+       <span class="attach-hint">${attachHint(entity)}</span>`
+    : `<span class="attach-hint">保存后可上传图片 / 附件${entity === 'archives' ? '（含 CAD 图纸，大小不限）' : ''}</span>`;
+  // 1.23.0：把渲染配置写进 dataset，上传 / 删除后原地重绘时不会丢失标题开关、空态文案与只读状态
+  return `<div class="attach-panel" data-entity="${esc(entity)}" data-eid="${id || ''}" data-title="${opt.title === false ? '0' : '1'}" data-empty="${esc(opt.empty || '')}" data-readonly="${opt.readonly ? '1' : '0'}">
+    ${opt.title === false ? '' : `<div class="sect-title">图片 / 附件${list.length ? `<span class="attach-hint" style="font-weight:400">共 ${list.length} 个</span>` : ''}<span class="line"></span></div>`}
+    ${list.length ? `<div class="attach-grid">${list.map(a => `
+      <div class="att">
+        <div class="att-thumb${attPreviewable(a) ? ' previewable' : ''}" data-act="viewAtt" data-id="${a.id}" title="${attPreviewable(a) ? '点击预览：' : ''}${esc(a.name)}">
+          ${isImg(a) ? `<img src="${attUrl(a)}" alt="${esc(a.name)}" loading="lazy">` : `<span class="ext">${esc(extOf(a.name))}</span>`}
+          ${attPreviewTag(a)}
+        </div>
+        <div class="att-meta">
+          <div class="att-name" title="${esc(a.name)}">${esc(a.name)}</div>
+          <div class="att-size">${sizeText(a.size)}${a.uploader ? ' · ' + esc(a.uploader) : ''}</div>
+        </div>
+        ${opt.readonly ? '' : `<button class="att-del" data-act="delAtt" data-id="${a.id}" title="删除附件">×</button>`}
+      </div>`).join('')}</div>` : `<div class="attach-empty">${opt.empty || '暂无图片或附件'}</div>`}
+    ${opt.readonly ? '' : `<div class="attach-actions">${upload}</div>`}
+  </div>`;
+}
+
+
+async function api(path, opt) {
+  opt = opt || {};
+  const cfg = Object.assign({ headers: { 'Content-Type': 'application/json' } }, opt);
+  if (cfg.body && typeof cfg.body !== 'string') cfg.body = JSON.stringify(cfg.body);
+  const res = await fetch(API_BASE + path, cfg);
+  if (res.status === 401 && !cfg._noGate) {
+    showLogin('登录已过期，请重新登录');
+    throw new Error('未登录或登录已过期');
+  }
+  let j;
+  try { j = await res.json(); } catch (e) { throw new Error('服务返回格式错误（HTTP ' + res.status + '）'); }
+  if (!res.ok || j.ok === false) throw new Error(j.error || ('请求失败 HTTP ' + res.status));
+  return j.data === undefined ? j : j.data;
+}
+
+function toast(msg, type) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (type === 'err' ? ' err' : '');
+  el.textContent = msg;
+  $('#toastWrap').appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .2s'; setTimeout(() => el.remove(), 220); }, 2600);
+}
+
+/* ============================================================
+   Excel 导出（服务端生成 xlsx，浏览器下载）
+   ============================================================ */
+/** 1.22.0：下载与在线预览共用同一份筛选参数，保证「预览的就是导出的」 */
+function exportParams(mod, extra) {
+  const params = new URLSearchParams();
+  params.set('module', mod || S.view);
+
+  if (!extra) {
+    // 跟随当前筛选条件：导出「看到的」
+    if (S.view === 'shops' && S.shopStatus !== 'all') {
+      if (S.shopStatus === 'arrears') params.set('arrears', '1');
+      else if (S.shopStatus === 'decorating') params.set('work', 'decoration');
+      else if (S.shopStatus === 'maintenance') params.set('repair', '1');
+      else params.set('status', S.shopStatus);
+    }
+    // 1.26.0：楼栋筛选跟随导出与表格预览
+    if (S.view === 'shops' && S.shopBuilding !== 'all') params.set('building', S.shopBuilding);
+    if (S.view === 'equipments' && S.eqCat !== 'all') params.set('cat', S.eqCat);
+    if (S.view === 'equipments' && S.eqMaintain !== 'all') params.set('maintain', S.eqMaintain);
+    if (S.view === 'contracts' && S.contractStatus !== 'all') params.set('status', S.contractStatus);
+    if (S.view === 'payments' && S.payFilter !== 'all') {
+      if (S.payFilter === 'overdue') params.set('overdue', '1');
+      else params.set('status', S.payFilter);
+    }
+    if (S.view === 'archives' && S.archiveCat !== 'all') params.set('cat', S.archiveCat);
+    if (S.view === 'archives' && S.archiveStatus !== 'all') params.set('status', S.archiveStatus);
+    if (S.view === 'warehouse' && S.warehouseCat !== 'all') params.set('cat', S.warehouseCat);
+    if (S.view === 'warehouse' && S.warehouseFilter === 'low') params.set('low', '1');
+  } else {
+    Object.keys(extra).forEach(k => params.set(k, extra[k]));
+  }
+  return params;
+}
+
+function exportExcel(mod, extra) {
+  const params = exportParams(mod, extra);
+  const a = document.createElement('a');
+  a.href = API_BASE + '/export?' + params.toString();
+  a.rel = 'noopener';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  toast('Excel 生成中，稍候浏览器会开始下载');
+}
+
+/** 1.22.0：点击「预览表格」先在二层弹窗里查看将导出的工作表，确认后再下载 */
+async function openExportPreview(mod, extra) {
+  S.lightReturn = null;
+  const params = exportParams(mod, extra);
+  params.set('preview', '1');
+  const label = (TITLES[params.get('module')] || {}).title || '台账';
+  const base = {
+    title: '表格预览 · ' + label,
+    sub: '按当前筛选条件生成，与「导出 Excel」内容一致',
+    size: 'xxl',
+    footer: `<button class="btn" data-act="closeLight">关闭</button>
+             <button class="btn btn-primary" data-act="export">下载 Excel</button>`
+  };
+  openLightbox(Object.assign({}, base, { body: '<div class="att-pv-empty">正在读取表格数据…</div>' }));
+  try {
+    const data = await api('/export?' + params.toString());
+    openLightbox(Object.assign({}, base, {
+      sub: `${data.label || label} · ${(data.sheets || []).length} 张工作表`,
+      body: attTableHtml(data)
+    }));
+  } catch (e) {
+    openLightbox(Object.assign({}, base, { body: `<div class="att-pv-empty">预览失败：${esc(e.message)}</div>` }));
+  }
+}
+
+/* ============================================================
+   全局状态
+   ============================================================ */
+const S = {
+  data: null,
+  // 弹窗回退：从详情页打开编辑表单时，关闭表单可退回详情
+  modalReturn: null,
+  // 1.22.0：从「+N 附件列表」点开预览时，关闭预览先回到附件列表（严格逐层）
+  lightReturn: null,
+  // 1.23.0：记录打开预览时的附件快照签名，关闭时若附件已变化则用最新数据重建列表
+  lightReturnSig: '',
+  // 1.24.0：OnlyOffice DocEditor 实例与已加载的 api.js 地址，关窗 / 换窗时销毁
+  ooEditor: null,
+  ooScriptUrl: '',
+  // 视图：优先恢复上次停留的模块，其次用设置里的「默认模块」
+  view: (() => {
+    try { return localStorage.getItem('pmops_last_view') || ''; } catch (e) { return ''; }
+  })(),
+  settings: {},
+  about: null,
+  shopQuery: '',
+  shopStatus: 'all',
+  // 1.26.0：商铺管理内的子页与楼栋筛选
+  shopTab: 'shops',          // 'shops' 商铺列表 | 'buildings' 楼栋管理
+  shopBuilding: 'all',       // 按楼栋名称筛选商铺（'all' = 全部）
+  // 各模块即时搜索关键词（仅前端过滤，与商铺搜索一致）
+  eqQuery: '',
+  contractQuery: '',
+  payQuery: '',
+  archiveQuery: '',
+  archiveCat: 'all',
+  archiveStatus: 'all',
+  warehouseQuery: '',
+  warehouseCat: 'all',
+  warehouseFilter: 'all',
+  // 各模块显示模式：list / card，存 localStorage
+  mode: (() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem('pmops_view_mode') || '{}');
+      return raw && typeof raw === 'object' ? raw : {};
+    } catch (e) { return {}; }
+  })(),
+  eqCat: 'all',
+  eqMaintain: 'all',        // 设备保养状态筛选（1.15.0）
+  contractStatus: 'all',
+  payFilter: 'all',
+  auth: null,               // 当前登录用户 {username, name, role}
+  users: null,              // 用户管理列表（管理员）
+  auditQ: { user: '', module: '', q: '', days: '30' },
+  charts: [],
+  // 可视化驾驶舱：时间范围 / 楼栋 / 分析维度 / 图表下钻
+  dashRange: '6',
+  dashBuilding: 'all',
+  cockpitTab: 'overview',
+  dashDrill: null,
+  formSubmit: null,
+  planDraft: null,             // 自定义付款计划编辑器草稿
+  pendingPlans: null,          // 新建合同时的自定义计划（随合同一起提交）
+  // 1.25.0：移动端抽屉导航开关（仅窄屏由 CSS 呈现，桌面端恒为关闭）
+  navOpen: false
+};
+
+/* ============================================================
+   1.25.0 全局手机端自适应 · 运行时部分
+   断点与 CSS 保持一致：≤820px 走抽屉导航，触摸设备禁用弹窗拖拽
+   ============================================================ */
+const MOBILE_MAX = 820;
+function isMobileLayout() {
+  const w = (typeof window !== 'undefined' && Number(window.innerWidth)) || 0;
+  return w > 0 && w <= MOBILE_MAX;
+}
+/** 屏幕方向 / 宽度变化时收起抽屉，避免切回桌面留下半屏遮罩 */
+function syncNavOnResize() {
+  if (!isMobileLayout() && S.navOpen) setNavOpen(false);
+}
+/** 打开 / 关闭抽屉：状态记在 S，视觉只靠 body.nav-open 驱动 CSS */
+function setNavOpen(on) {
+  S.navOpen = !!on;
+  const body = (typeof document !== 'undefined' && document.body) || null;
+  if (body && body.classList) {
+    if (typeof body.classList.toggle === 'function') body.classList.toggle('nav-open', S.navOpen);
+    else if (S.navOpen && body.classList.add) body.classList.add('nav-open');
+    else if (!S.navOpen && body.classList.remove) body.classList.remove('nav-open');
+  }
+  const btn = (typeof document !== 'undefined' && typeof document.querySelector === 'function')
+    ? document.querySelector('#navToggle') : null;
+  if (btn && typeof btn.setAttribute === 'function') btn.setAttribute('aria-expanded', S.navOpen ? 'true' : 'false');
+  return S.navOpen;
+}
+function toggleNav() { return setNavOpen(!S.navOpen); }
+function closeNav() { return setNavOpen(false); }
+/** 手机端触摸不 dragging：避免手指在标题栏 / 正文上滑动时弹窗乱跑 */
+function dragEventAllowed(e) {
+  if (!isMobileLayout()) return true;
+  const kind = e && e.pointerType;
+  if (kind && kind !== 'mouse' && kind !== 'pen') return false;
+  // 无 PointerEvent 的旧移动浏览器一律按触摸处理
+  if (!kind && typeof window !== 'undefined' && !window.PointerEvent) return false;
+  return true;
+}
+/** 图表随视口 / 横竖屏切换重算，手机端图表高度由 CSS 决定 */
+function resizeCharts() {
+  S.charts.forEach(c => { try { c.resize(); } catch (err) {} });
+}
+
+const ROLE_LABEL = { admin: '管理员', operator: '操作员', viewer: '只读' };
+const canEdit = () => !S.auth || S.auth.role !== 'viewer';
+const isAdmin = () => !!S.auth && S.auth.role === 'admin';
+
+const TITLES = {
+  dashboard: { title: '可视化驾驶舱', sub: '经营快照、KPI、多维图表与风险待办 · 全部指标实时关联现有业务数据' },
+  shops: { title: '商铺管理', sub: '面积、租金单价、水电抄表与费用账单（逐条可编辑）' },
+  equipments: { title: '设备管理', sub: '八类设备台账 · 保养状态可编辑 · 巡检 / 维修 / 保养记录逐条可编辑' },
+  contracts: { title: '项目合同管理', sub: '工程合同、付款计划与施工进度联动' },
+  payments: { title: '项目付款台帐', sub: '所有合同付款节点与实付流水' },
+  archives: { title: '档案管理', sub: '合同 / 图纸 / 证照 / 验收资料归档、借阅归还与到期提醒' },
+  warehouse: { title: '仓库管理', sub: '物料台账、安全库存预警与入库 / 出库 / 盘点流水' },
+  users: { title: '用户管理', sub: '应用账号、角色权限与登录控制（仅管理员）' },
+  audit: { title: '操作日志', sub: '登录与关键操作的留痕记录，可按人、模块、时间筛选' },
+  settings: { title: '系统设置', sub: '项目信息、计费默认值、到期提醒与显示偏好' },
+  about: { title: '关于应用', sub: '版本信息、运行环境、数据规模与更新日志' }
+};
+
+const TBL_LABEL = {
+  shops: '商铺', readings: '水电抄表', bills: '商铺账单', equipments: '设备台账',
+  equipment_logs: '设备维保记录', contracts: '工程合同', payment_plans: '付款计划',
+  payments: '付款流水', progress_logs: '施工进度', attachments: '附件'
+};
+
+const CHANGELOG = [
+  {
+    v: '1.26.0', d: '2026-11-10', cur: true, items: [
+      '商铺管理新增「楼栋管理」子页：顶部可在「商铺列表 / 楼栋管理」间切换，按楼栋实时汇总商铺数、在租 / 空置 / 维修 / 装修中、面积、月租金、欠费与出租率，整体指标与单栋进度条一目了然',
+      '楼栋台账支持新增 / 编辑 / 删除 / 详情：编号、名称、楼层、建筑面积、负责人、电话、建成年份、启用状态与备注；楼栋详情列出所属商铺，可挂楼栋平面图、CAD 图纸与验收资料附件（CAD 不限大小）',
+      '商铺表单「楼栋」由自由文本改为从楼栋台账下拉选择，编辑历史数据自动保留原值；商铺列表新增楼栋筛选标签，与搜索、状态筛选叠加，筛选结果同步到导出 Excel 与「预览表格」',
+      '数据一致性保护：楼栋名称唯一校验；改名自动同步该楼栋下全部商铺的楼栋字段；楼栋下仍有商铺时拒绝删除并提示先迁移；旧版本升级时按现有商铺的楼栋自动补建台账，商铺里出现但未建档的楼栋支持「一键补建」',
+      'Excel 导出新增「楼栋汇总」工作表（商铺模块 5 张、全量 19 张），表头含状态分布 / 面积 / 租金 / 欠费 / 出租率 / 负责人等 19 列；可视化驾驶舱与全量备份同步纳入楼栋数据，手机端楼栋卡片自动单列'
+    ]
+  },
+  {
+    v: '1.25.0', d: '2026-11-09', items: [
+      '新增全局手机端网页自适应：≤820px 自动切换为抽屉式侧栏 + 汉堡菜单，点击遮罩、右上角 ×、切换模块或按 ESC 均可收起，桌面端布局完全不变',
+      '全模块响应式重排：商铺 / 设备 / 合同 / 付款 / 档案 / 仓库的卡片、统计栏、筛选栏、搜索框、表格与详情键值在手机上单列或两列紧凑排布，宽表格改为左右滑动查看，不再撑破页面',
+      '可视化驾驶舱手机端优化：KPI、六宫格指标、补充指标带改两列，图表高度随屏幕收缩并在横竖屏切换时自动重算，顶部工具条与维度标签可横向滑动',
+      '弹窗手机端近全屏显示：标题栏固定、内容区独立滚动、底部按钮自动换行铺满，PDF / 表格 / OnlyOffice 预览高度按可视高度适配；表单输入统一 16px，避免 iOS 聚焦时自动缩放',
+      '触摸设备不再拖动弹窗，避免与页面滚动 / 输入抢手势；打印档案仍走独立 A4 排版，所有移动端规则仅对屏幕生效，不影响打印与导出'
+    ]
+  },
+  {
+    v: '1.24.0', d: '2026-11-09', items: [
+      '新增 OnlyOffice 在线预览：Word（doc / docx / rtf / odt）、演示（ppt / pptx / odp）与旧版 xls 等原本只能下载的附件，点开即在弹窗内由 Document Server 完整渲染，保留排版、公式、图表与页码',
+      '系统设置新增「Office 在线预览」：启用开关、Document Server 地址、可选 JWT 密钥、本应用对外地址，并提供「测试连接」一键探测 healthcheck / api.js；不启用时全部走内置预览，零外部依赖',
+      '内置预览与 OnlyOffice 可互相切换：PDF / Excel / CSV / 文本仍优先走轻量内置预览，预览窗底部可一键「用 OnlyOffice 打开」查看完整版式，Office 预览窗也能切回内置表格视图',
+      '预览为只读模式，不会写回或覆盖原附件；DocServer 反向拉取原文件走 6 小时短期签名 URL（无需登录 Cookie，支持 Range 分段），无效 / 过期链接一律 403',
+      'JWT 密钥仅保存在服务端并参与签名，设置读取、保存回传与全量备份均做掩码处理，浏览器与只读账号都拿不到明文；附件上传类型同步扩充 PPT / ODF / xlsm 等格式'
+    ]
+  },
+  {
+    v: '1.23.0', d: '2026-11-09', items: [
+      '修复上传详情附件不同步 BUG：上传成功即并入本地附件缓存，详情弹窗的缩略图条 / 空态占位、附件面板、附件总览计数与列表页附件数同时刷新，不必关闭再打开详情',
+      '附件面板重绘保留原有标题开关、空态文案与只读配置；上传 / 删除统一走「服务端最新列表校正 → 主视图 → 弹窗」的同步链路，整包刷新异常也不会留下旧界面',
+      '从「+N 附件总览」点开预览期间若附件有增删，关闭预览时用最新数据重建总览，继续保持「只有关闭按钮 / × 生效、一次只收一层」的逐层规则',
+      '打开附件总览时主动向服务端核对最新附件，避免另一个页面 / 标签页上传后本页仍显示旧列表；服务端删除附件同时回传该记录的最新附件列表'
+    ]
+  },
+  {
+    v: '1.22.0', d: '2026-11-09', items: [
+      '附件支持点击在线预览：PDF 直接在弹窗内嵌阅读器打开（可新窗口打开 / 下载），Excel（.xlsx / .xlsm）、CSV / TSV 与纯文本渲染成可切换工作表的表格，附件卡片新增「PDF 预览 / 表格预览」角标',
+      '顶栏新增「预览表格」：按当前模块与筛选条件先查看将要导出的全部工作表，确认无误后再下载 Excel，预览与导出共用同一份筛选参数',
+      '服务端零依赖解析 xlsx 的 ZIP / OOXML 与 CSV，含行列上限、体积上限与路径校验；PDF 附件按扩展名修正 MIME 并支持 Range 分段加载，避免浏览器内置阅读器取不到文件',
+      '从「+N 附件列表」点开的预览，关闭后先回到附件列表，继续保持「只有关闭按钮 / × 生效、一次只收一层」的弹窗规则'
+    ]
+  },
+  {
+    v: '1.21.0', d: '2026-11-08', items: [
+      '商铺管理「打印档案」精简：A4 打印稿不再输出「装修 / 维修工程状态与进度」整个区块，隐藏装修、维修工程状态卡与装修进度记录、维修进度记录两条时间线',
+      '商铺详情弹窗、列表 / 方块卡片、统计栏筛选与 Excel「装修维修进度」工作表保持原样，仅打印稿回归纯租赁档案，便于对外归档与交付',
+      '打印样式同步兜底隐藏 work-panel，避免浏览器缓存旧样式时把已移除的区块带回打印页'
+    ]
+  },
+  {
+    v: '1.20.0', d: '2026-11-08', items: [
+      '优化弹窗关闭机制：只有点击弹窗底部「关闭 / 取消」按钮或右上角 × 才会关闭，点击弹窗外空白处、按 ESC、拖选文字或拖动弹窗后补发的点击都一律不关闭，避免误点丢失内容',
+      '弹窗改为严格逐层关闭：二层图片 / 附件预览 → 一层详情窗 → 编辑表单回退详情 → 完全关闭，每次只收一层，不再出现点一次空白整栈消失或跳过详情页的情况',
+      '移除「点遮罩一次性收掉整个弹窗栈」与 ESC 关闭；ESC 改为轻提示引导使用关闭按钮，弹窗标题栏同步标注「请点右上角 × 关闭」',
+      '表单内即使有未保存内容，点击「取消 / ×」也按明确意图直接关闭；保存成功、确认删除等业务动作的程序化收窗行为保持不变'
+    ]
+  },
+  {
+    v: '1.19.0', d: '2026-11-08', items: [
+      '修复弹窗外点击空白处的关闭行为：按下的落点必须也在遮罩上才关闭，拖选文字与拖动弹窗后补发的点击不再误关；二层附件预览优先关闭，不会连带关掉一层详情窗',
+      '表单有未保存内容时点击弹窗外空白不再直接丢弃数据，改为提示引导点击「取消」或右上角 ×；点遮罩关闭会收掉整个弹窗栈，不再一层层回退',
+      '档案管理支持上传 CAD / 工程图纸（DWG、DXF、DWF、RVT、SKP、STEP、IGES 等）与常见文档，单个文件大小不限；服务端改为流式落盘，内存占用恒定',
+      '档案附件预览对 CAD 文件给出「请用专业软件打开」提示并保留下载入口；其余模块仍按 25MB 限制，避免误传超大文件',
+      '商铺统计栏删除与「维修」重复的「维修中」类目，只保留唯一「维修」：口径为经营业态维修或维修工程进行中的并集去重，点击筛选、导出与统计数字完全一致',
+      '同步修正驾驶舱资产结构环图、楼栋图表与「维修」明细下钻的同源口径（四类互斥且合计 = 商铺总数），旧筛选值「维修中」自动归一',
+      '商铺详情与编辑表单把进度类目标注为「维修工程」，与经营业态「维修」清晰区分'
+    ]
+  },
+  {
+    v: '1.18.0', d: '2026-11-08', items: [
+      '商铺管理新增「装修状态」与「维修处理状态」：状态、百分比与进度说明联动，商铺详情可逐条新增 / 编辑 / 删除装修与维修进度，最新一条自动回算状态与进度',
+      '商铺编辑表单可直接设置装修 / 维修状态，统计栏新增「装修中 / 维修中」筛选；进度时间线同步进入商铺 A4 打印档案与 Excel 导出',
+      '新增「档案管理」模块：合同 / 图纸 / 证照 / 验收 / 设备 / 商铺资料分类归档，含密级、存放位置、保管人、有效期、附件与关联业务对象',
+      '档案支持借阅 / 归还登记，流水自动回写「在档 / 借出」状态；支持搜索、分类与状态筛选、列表 / 方块、打印档案卡与 Excel 导出',
+      '新增「仓库管理」模块：物料台账含规格、单位、库位、供应商、安全库存与单价，出入库与盘点流水自动重算结存、金额与当前库存',
+      '仓库低库存自动预警，出库数量超过结存时服务端拒绝写入；流水可编辑 / 删除并自动回算，支持搜索、分类筛选、打印与 Excel 导出',
+      '可视化驾驶舱与全量导出同步纳入装修 / 维修进度、档案借阅与仓库库存指标；操作日志、备份与附件体系覆盖全部新增模块'
+    ]
+  },
+  {
+    v: '1.17.0', d: '2026-11-08', items: [
+      '概览模块与可视化面板合并为唯一的「可视化驾驶舱」：左侧导航只保留一个入口，旧书签与旧默认模块（overview）自动归一到新模块，不再出现两个内容重复的页面',
+      '合并后去重展示：经营收支趋势、商铺资产结构、风险与待办、合同结构不再重复出现；原先 6 个独立补充指标块压成一条紧凑指标带，把首屏空间让给图表',
+      '驾驶舱新增「经营总览 / 资产与租赁 / 经营与收支 / 设备与工程」四个分析维度，首屏只渲染当前维度的图表；切换维度、时间范围或楼栋后全部指标实时重算',
+      '经营快照头、六张可点击 KPI 卡、补充指标带与明细下钻区常驻，任何维度点击图表或风险条目都能在底部追溯原始业务记录并一键直达档案',
+      '优化登录流程：登录成功后固定进入可视化驾驶舱并重置分析维度与筛选，不再被「上次停留模块」带偏；同一浏览器刷新页面仍保留模块记忆',
+      '登录遮罩保持到数据加载完成，杜绝登录后闪一下空白主界面；新增防重复提交、登录中 / 载入中状态、失败自动清空密码并聚焦',
+      '系统设置「默认模块」默认值改为可视化驾驶舱，旧库里保存的 overview 自动归一；设置页与关于页的模块清单同步为 5 个工作台模块'
+    ]
+  },
+  {
+    v: '1.16.0', d: '2026-11-08', items: [
+      '修复 BUG：系统设置「项目信息」清空或修改后无法保存——旧逻辑把空字符串当成「未设置」，刷新后又被默认值覆盖；现在空白是有效值，填写 / 修改 / 清空均可正确落库并立即生效',
+      '项目信息改为空白出厂：公司名称、项目名称、负责人、电话、地址默认全部留空，不再预置任何单位名称；升级时会自动清掉旧版本预填的公司名，打印单据抬头自动回退为「物业工程管理」',
+      '保存设置改用字段白名单提交并回写服务端返回值，清空数值项会恢复该项出厂默认值，保存失败时按钮状态与错误提示更明确',
+      '弹窗拖动整体优化：启用指针捕获，鼠标移出弹窗或窗口边缘仍跟手；起拖即冻结出场动画并用逐帧刷新，消除首次移动跳位与拖动抖动',
+      '拖动时全窗统一光标并禁止选中文字 / 原生图片拖拽，正文表格文字不再误触发拖动；边界按弹窗真实尺寸计算，始终保留标题栏可见',
+      '拖到遮罩上松手不再误关弹窗（抑制补发的点击）；双击标题栏可一键回正位置；一层详情窗与二层图片 / 附件预览窗同步生效'
+    ]
+  },
+  {
+    v: '1.15.0', d: '2026-11-07', items: [
+      '设备管理新增「保养状态」：设备台账列表 / 方块、详情档案均可查看，工具栏可按 正常 / 待保养 / 保养中 / 已完成 / 已延期 筛选统计',
+      '点设备行「保养」或详情里的「编辑保养状态」即可修改状态与下次保养日期；可填写保养说明并自动追加一条带状态的保养记录，标记「已完成」后不再进入待保养提醒',
+      '巡检 / 维修 / 保养记录支持逐条编辑与删除：可改记录类型、日期、保养状态、处理内容、费用、经办人与下次保养日期，保存后最新一条保养记录的状态自动同步到设备',
+      '删除最新保养记录时，设备状态按剩余记录自动回退；记录类型、日期格式、费用与保养状态均有服务端校验，全部变更写入操作日志',
+      '设备 A4 打印档案与 Excel 导出同步增加保养状态列，导出跟随当前保养状态筛选；概览待保养提醒与本轮已完成状态联动'
+    ]
+  },
+  {
+    v: '1.14.0', d: '2026-11-07', items: [
+      '详情窗与图片 / 附件预览窗支持按住标题栏（或窗口空白处）不放拖动移动；位移限制在可视范围内，关闭 / 回退弹窗后自动复位，不影响按钮、输入与遮罩点击关闭',
+      '商铺管理的水电抄表记录与费用账单支持逐条编辑、删除：抄表可改账期、读数、单价、日期与备注，保存后自动重算用量 / 水费 / 电费并同步同账期未收款账单',
+      '费用账单可修正租金、水费、电费、其他费用、收款状态与收款日期，合计自动重算；欠费统计、概览指标、Excel 导出随之同步；已收款账单保持历史金额不被抄表改动覆盖',
+      '概览「商铺资产结构」与商铺管理统计栏对齐为「在租 / 空置 / 维修 / 欠费」四类目：环图按欠费优先拆分为互斥四段，卡片下方显示与统计栏同口径的类目数值，点击可下钻明细并预置筛选'
+    ]
+  },
+  {
+    v: '1.13.0', d: '2026-11-07', items: [
+      '概览与可视化面板整体重新设计：新增经营快照头、六张可点击 KPI 卡、风险与待办清单、经营明细下钻区，统一视觉与信息层级',
+      '所有指标与图表实时关联现有业务数据：商铺档案、费用账单、水电抄表、设备台账与维保记录、工程合同、付款计划与付款流水，数据变更后刷新即更新',
+      '顶部支持「近 6 个月 / 近 12 个月 / 本年度」时间范围切换与楼栋范围筛选；商铺、账单、抄表指标随楼栋联动，设备与合同保持全项目口径',
+      'KPI 卡可直接跳转到对应业务模块并自动带上筛选（欠费商铺、逾期付款、维修设备、在建合同等），实现面板 → 台账联动',
+      '点击任意图表柱 / 扇区 / 数据点或风险条目，下钻区展示对应原始记录；明细行可一键打开商铺 / 设备 / 合同档案',
+      '可视化面板扩展为 9 张图表：楼栋出租结构、楼栋租金与欠费、设备分类状态、合同付款执行、经营收支、账单收缴、水电用量与费用、付款节点到期分布、合同结构',
+      '服务端概览聚合新增账单收缴率、欠费金额与笔数、60 天内租约到期、维保费用等指标，待办提醒同步纳入欠费与租约到期'
+    ]
+  },
+  {
+    v: '1.12.0', d: '2026-11-07', items: [
+      '设备管理、项目合同管理、项目付款台帐新增工具栏即时搜索框（与商铺「搜索商铺 / 租户」一致）：输入即筛选、保留光标，可与分类 / 状态筛选叠加使用',
+      '设备可按名称 / 编号 / 安装位置 / 品牌 / 型号 / 分类 / 状态 / 备注搜索；合同可按名称 / 编号 / 施工方 / 联系人 / 电话 / 类型 / 状态 / 备注搜索；付款节点可按节点名 / 所属合同 / 施工方 / 凭证号 / 备注搜索',
+      '商铺管理状态统计栏在「维修」后新增「欠费」项：显示欠费总额（标红提醒），悬停查看欠费商铺数，点击即可筛选出有未收款账单的商铺',
+      '概览「商铺总数」卡片同步显示欠费商铺数与金额；欠费视图下 Excel 导出只包含欠费商铺；商铺搜索扩展支持楼栋 / 楼层 / 租户电话'
+    ]
+  },
+  {
+    v: '1.11.0', d: '2026-11-07', items: [
+      '项目合同管理新增「自定义付款计划」：可在合同详情一次性编排全部付款节点，支持增删期次、上下移动、逐期填写名称 / 金额 / 比例 / 触发方式 / 进度阈值 / 应付日期 / 备注',
+      '金额与占合同比例双向联动，实时显示计划合计、比例合计与待分配金额；提供「按剩余金额均分」「套用标准四期 / 三期模板」「清空未付节点」快捷操作',
+      '新建合同可直接选择「自定义付款计划」模板，编排好的节点随合同一次创建；编辑草稿时保留已填写的合同资料',
+      '服务端新增批量保存接口：原地更新已有节点（附件不丢），已付款节点强制保留且金额只读，付款流水不受影响'
+    ]
+  },
+  {
+    v: '1.10.1', d: '2026-11-07', items: [
+      '修复 BUG：商铺手动输入「月租金总金额」后未自动计算租金单价——现在输入总额即时反算单价（总额 ÷ 面积），改面积同步重算、改单价同步总额',
+      '打开商铺编辑表单时按已有手动总额自动校正单价；卡片、列表、详情、打印档案与 Excel 导出均显示一致的反算单价',
+      '保存与服务端接口双重兜底，确保数据库中单价与手动总额始终一致；留空总额仍按 单价 × 面积 自动计算'
+    ]
+  },
+  {
+    v: '1.10.0', d: '2026-11-07', items: [
+      '付款节点支持手动输入金额自动计算占合同比例（合同管理与付款台帐通用，金额 ⇄ 比例双向联动）；登记付款时实时显示占计划 / 占合同比例',
+      '商铺编辑新增「月租金总金额」手动输入，留空仍按 单价 × 面积 自动计算；账单租金与概览统计同步采用',
+      '设备管理新增打印：设备详情可按 A4 排版打印档案（基本信息、维保记录、现场图片）',
+      '修复 BUG：从详情页点「编辑资料」，关闭编辑后误关详情页——现在关闭编辑会退回详情页',
+      '修复 BUG：侧栏开发者署名下的版本号不同步，现与服务器版本实时一致'
+    ]
+  },
+  {
+    v: '1.9.1', d: '2026-11-07', items: [
+      '方块卡片不再显示图片 / 附件缩略图（商铺 / 设备 / 合同 / 付款节点），缩略图集中在详情与编辑弹窗查看，卡片更简洁'
+    ]
+  },
+  {
+    v: '1.9.0', d: '2026-11-07', items: [
+      '修复时间同步 BUG：操作日志、最后登录、附件上传时间、关于页启动时间此前比北京时间慢 8 小时（服务端误用 UTC 时间），现全部改为本地时区时间',
+      '方块卡片整体调小：卡片更紧凑，一屏可显示更多（商铺 / 合同 / 设备 / 付款台帐）',
+      '商铺方块卡片中商铺编号字体放大一号，更醒目'
+    ]
+  },
+  {
+    v: '1.8.0', d: '2026-11-07', items: [
+      '修复 BUG：图片 / 附件预览关闭时误关整个详情弹窗——预览改为独立二层窗口，关闭只收掉预览',
+      '「+N」完整附件列表同样改为二层窗口；ESC 先关预览、再关详情',
+      '项目合同管理新增打印：A4 档案含基本信息、金额统计、付款计划、施工进度、付款流水与现场图片'
+    ]
+  },
+  {
+    v: '1.7.0', d: '2026-11-07', items: [
+      '商铺管理新增图片 / 附件上传：详情弹窗与编辑表单均可上传并显示缩略图，点击查看大图、下载原文件',
+      '方块模式卡片直接预览商铺照片；删除商铺时同步清理其附件文件',
+      '打印档案随附现场图片（A4 排版，自动注入 base 修复打印稿图片路径），打印稿不含上传面板'
+    ]
+  },
+  {
+    v: '1.6.0', d: '2026-11-06', items: [
+      '新增登录首页：应用自有账号体系（管理员 / 操作员 / 只读三种角色），登录后才能查看与操作数据',
+      '新增「用户管理」（仅管理员）：新建账号、分配角色、重置密码、停用 / 删除，系统始终保留一个启用的管理员',
+      '新增「操作日志」：登录、增删改、设置变更、导出备份等关键动作全部留痕，可按人、模块、时间与关键词筛选',
+      '「功能模块」从关于页移到系统设置；开发者署名移到左侧栏底部居中',
+      '首次启动自动创建初始管理员 admin（初始密码 admin123，登录后会提示修改）'
+    ]
+  },
+  {
+    v: '1.5.0', d: '2026-11-06', items: [
+      '新增局域网直连：同一内网用 http://<NAS IP>:3340 访问，手机 / 平板 / 其他电脑均可打开，无需经过飞牛桌面',
+      '「合同管理」更名为「项目合同管理」，「付款台账」更名为「项目付款台帐」',
+      '商铺详情新增「打印」：A4 排版、保留表格与统计样式，可直接打印或另存 PDF',
+      '左侧栏不再显示数据引擎与数据库文件名，相关信息集中到「系统设置 · 存储状态」'
+    ]
+  },
+  {
+    v: '1.4.0', d: '2026-11-06', items: [
+      '新增「系统设置」：项目信息、新商铺默认水电单价、付款与保养提前提醒天数、默认模块与显示模式',
+      '新增「关于应用」：版本、运行环境、数据规模、模块清单、更新日志与技术支持',
+      '付款节点按设置的提前天数自动置为待支付；设备保养按提前天数进入临期预警',
+      '支持一键备份全量数据（JSON 快照），含设置与附件索引',
+      '记住上次停留的模块，下次打开直接回到原处'
+    ]
+  },
+  {
+    v: '1.3.0', d: '2026-11-05', items: [
+      '合同、设备、付款台帐支持列表 / 方块视图切换',
+      '三类记录均可上传图片与附件，卡片与详情显示缩略图，可查看大图或下载原文件',
+      '付款节点支持编辑，支持单独导出'
+    ]
+  },
+  {
+    v: '1.2.0', d: '2026-11-05', items: ['商铺管理新增列表 / 方块显示模式，偏好本地记忆']
+  },
+  {
+    v: '1.1.0', d: '2026-11-05', items: [
+      '设备分类扩展为 8 类：空调、消防、强电、弱电、给排水、电梯、厨房设备、其他',
+      '全部模块支持 Excel 导出（6 个模块 / 13 张工作表）'
+    ]
+  },
+  {
+    v: '1.0.0', d: '2026-11-05', items: ['首个版本：商铺、设备、合同、付款台帐与可视化面板']
+  }
+];
+
+/* ============================================================
+   数据加载
+   ============================================================ */
+/** 侧栏版本号与服务端保持同步（修复版本号不同步 BUG） */
+function syncVersion() {
+  const mv = S.data && S.data.meta && S.data.meta.app && S.data.meta.app.version;
+  if (!mv) return;
+  const dv = $('#devVer');
+  if (dv) dv.textContent = 'v' + mv;
+}
+
+async function load() {
+  try {
+    S.data = await api('/bootstrap');
+    S.settings = S.data.settings || {};
+    S.auth = (S.data.meta && S.data.meta.user) || null;
+    syncVersion();
+    hideLogin();
+    renderUserChip();
+    // 旧版「概览」记忆 / 旧默认模块自动归一到合并后的可视化驾驶舱
+    S.view = normalizeView(S.view || S.settings.default_view || COCKPIT_VIEW);
+    if (!TITLES[S.view]) S.view = COCKPIT_VIEW;
+    render();
+  } catch (e) {
+    // 未登录时由 showLogin 接管界面，不再显示报错卡片
+    if (String(e.message).indexOf('未登录') >= 0) return;
+    $('#view').innerHTML = `<div class="card"><div class="empty">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg>
+      数据加载失败：${esc(e.message)}<br><br>
+      <button class="btn" onclick="location.reload()">重新加载</button></div></div>`;
+  }
+}
+
+async function refresh(then) {
+  try {
+    S.data = await api('/bootstrap');
+    S.settings = S.data.settings || S.settings;
+    syncVersion();
+    render();
+    if (then) then();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* ============================================================
+   主渲染
+   ============================================================ */
+function render() {
+  const t = TITLES[S.view] || TITLES[COCKPIT_VIEW];
+  $('#viewTitle').textContent = t.title;
+  $('#viewSub').textContent = t.sub;
+  $('#topActions').innerHTML = topAction();
+  renderNav();
+  renderBrand();
+  const map = {
+    dashboard: viewCockpit, shops: viewShops,
+    equipments: viewEquipments, contracts: viewContracts, payments: viewPayments,
+    archives: viewArchives, warehouse: viewWarehouse,
+    settings: viewSettings, about: viewAbout, users: viewUsers, audit: viewAudit
+  };
+  disposeCharts();
+  $('#view').innerHTML = (map[S.view] || viewCockpit)();
+  // 旧视图别名 overview 也渲染同一驾驶舱，保证书签 / 旧本地记忆不空白
+  if (S.view === COCKPIT_VIEW || S.view === 'overview') mountCockpitCharts();
+  if (S.view === 'about') loadAbout();
+  if (S.view === 'users') loadUsers();
+  if (S.view === 'audit') loadAudit();
+  renderUserChip();
+}
+
+function renderBrand() {
+  const s = S.settings || {};
+  const name = (s.project_name || '').trim();
+  $('#brandName').textContent = name || '物业工程管理';
+  $('#brandSub').textContent = name ? '物业工程管理' : 'Property Ops';
+}
+
+/** 记住当前模块，下次打开回到原处 */
+function setView(v) {
+  S.view = normalizeView(v);
+  // 1.25.0：任何模块切换（侧栏、驾驶舱 KPI、下钻）都顺手收起移动端抽屉
+  closeNav();
+  try { localStorage.setItem('pmops_last_view', S.view); } catch (e) {}
+}
+
+function renderNav() {
+  const d = S.data || { shops: [], equipments: [], contracts: [], payment_plans: [] };
+  const items = [
+    ['dashboard', '可视化驾驶舱', 'M4 20V10M10 20V4M16 20v-6M22 20H2', ''],
+    ['shops', '商铺管理', 'M4 9h16v11H4zM3 9l1.6-4h14.8L21 9M9 20v-5h6v5', d.shops.length],
+    ['equipments', '设备管理', 'M12 15a3 3 0 100-6 3 3 0 000 6zM19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-1.8-.3 1.6 1.6 0 00-1 1.5V21a2 2 0 11-4 0v-.1A1.6 1.6 0 008 19.4a1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.6 1.6 0 00.3-1.8 1.6 1.6 0 00-1.5-1H2a2 2 0 110-4h.1A1.6 1.6 0 004.6 8a1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V2a2 2 0 114 0v.1a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1H22a2 2 0 110 4h-.1a1.6 1.6 0 00-1.5 1z', d.equipments.length],
+    ['contracts', '项目合同管理', 'M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-5zM14 3v5h5M9 13h6M9 17h4', d.contracts.length],
+    ['payments', '项目付款台帐', 'M3 7h18v12H3zM3 7l2-3h14l2 3M8 13h3', d.payment_plans.filter(p => p.status !== 'paid').length],
+    ['archives', '档案管理', 'M4 4h6a2 2 0 012 2v14a2 2 0 00-2-2H4zM20 4h-6a2 2 0 00-2 2v14a2 2 0 012-2h6zM8 8h2M14 8h2', (d.archives || []).length],
+    ['warehouse', '仓库管理', 'M3 9l9-5 9 5v11H3zM8 20v-7h8v7M3 9h18', (d.warehouse_items || []).length]
+  ];
+  const sysItems = [
+    ['settings', '系统设置', 'M12 15a3 3 0 100-6 3 3 0 000 6zM19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-1.8-.3 1.6 1.6 0 00-1 1.5V21a2 2 0 11-4 0v-.1A1.6 1.6 0 008 19.4a1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.6 1.6 0 00.3-1.8 1.6 1.6 0 00-1.5-1H2a2 2 0 110-4h.1A1.6 1.6 0 004.6 8a1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V2a2 2 0 114 0v.1a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1H22a2 2 0 110 4h-.1a1.6 1.6 0 00-1.5 1z', ''],
+    ['about', '关于应用', 'M12 21a9 9 0 100-18 9 9 0 000 18zM12 11v5M12 8h.01', '']
+  ];
+  if (isAdmin()) {
+    sysItems.unshift(
+      ['users', '用户管理', 'M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zM22 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75', ''],
+      ['audit', '操作日志', 'M12 8v4l3 3M21 12a9 9 0 11-18 0 9 9 0 0118 0z', '']
+    );
+  }
+  const item = (it) => `
+    <button class="nav-item ${S.view === it[0] ? 'active' : ''}" data-act="nav" data-view="${it[0]}">
+      <svg viewBox="0 0 24 24"><path d="${it[2]}"/></svg><span>${it[1]}</span>
+      ${it[3] ? `<span class="nav-count">${it[3]}</span>` : ''}
+    </button>`;
+  $('#nav').innerHTML = `<div class="nav-label">工作台</div>` + items.map(item).join('')
+    + `<div class="nav-label">系统</div>` + sysItems.map(item).join('');
+}
+
+function topAction() {
+  const icon = (d) => `<svg viewBox="0 0 24 24"><path d="${d}"/></svg>`;
+  const ICON_DOWN = 'M12 3v11m0 0l-3.6-3.6M12 14l3.6-3.6M4 16v3a2 2 0 002 2h12a2 2 0 002-2v-3';
+  const ICON_ALL = 'M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z';
+
+  const add = canEdit() ? ({
+    shops: S.shopTab === 'buildings'
+      ? `<button class="btn btn-primary" data-act="newBuilding">${icon('M12 5v14M5 12h14')}新增楼栋</button>`
+      : `<button class="btn btn-primary" data-act="newShop">${icon('M12 5v14M5 12h14')}新增商铺</button>`,
+    equipments: `<button class="btn btn-primary" data-act="newEq">${icon('M12 5v14M5 12h14')}新增设备</button>`,
+    contracts: `<button class="btn btn-primary" data-act="newContract">${icon('M12 5v14M5 12h14')}新增合同</button>`,
+    archives: `<button class="btn btn-primary" data-act="newArchive">${icon('M12 5v14M5 12h14')}新增档案</button>`,
+    warehouse: `<button class="btn btn-primary" data-act="newWhItem">${icon('M12 5v14M5 12h14')}新增物料</button>`
+  }[S.view] || '') : '';
+
+  const exportBtn = `<button class="btn" data-act="export" title="按当前筛选条件导出 Excel">${icon(ICON_DOWN)}导出 Excel</button>`;
+  const previewBtn = `<button class="btn" data-act="previewExport" title="先在弹窗里查看将导出的表格，再决定是否下载">${icon('M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12z M12 9a3 3 0 100 6 3 3 0 000-6')}预览表格</button>`;
+  const exportAll = `<button class="btn" data-act="exportAll" title="导出全部模块（多工作表）">${icon(ICON_ALL)}导出全部</button>`;
+  const backupBtn = `<button class="btn" data-act="backup" title="下载全量数据快照（JSON）">${icon('M12 3v11m0 0l-3.6-3.6M12 14l3.6-3.6M4 16v3a2 2 0 002 2h12a2 2 0 002-2v-3')}备份数据</button>`;
+
+  if (S.view === 'settings') {
+    return `<button class="btn" data-act="resetSettings">恢复默认</button>
+            <button class="btn btn-primary" data-act="saveSettings">${icon('M5 12l5 5L20 7')}保存设置</button>`;
+  }
+  if (S.view === 'about') {
+    return backupBtn + exportAll;
+  }
+
+  return exportBtn + previewBtn + ((S.view === COCKPIT_VIEW || S.view === 'overview') ? exportAll : '') + add;
+}
+
+/* ============================================================
+   经营驾驶舱 · 统一数据层（1.13.0）
+   所有指标直接由 bootstrap 下发的现有业务表实时聚合：
+   shops / bills / readings / equipments / equipment_logs /
+   contracts / payment_plans / payments
+   ============================================================ */
+const DASH_RANGES = [
+  { k: '6', n: '近 6 个月' },
+  { k: '12', n: '近 12 个月' },
+  { k: 'ytd', n: '本年度' }
+];
+const DRILL_LABEL = {
+  building: '楼栋商铺', shopStatus: '商铺状态', arrears: '欠费商铺', lease: '租约到期',
+  vacant: '空置商铺', eqCat: '设备分类', repair: '维修设备', maintain: '保养预警',
+  contract: '工程合同', overdue: '逾期付款', plan: '付款节点', month: '月度明细',
+  utility: '水电抄表', bill: '费用账单'
+};
+const dashSum = (arr, fn) => (arr || []).reduce((n, x) => n + (Number(fn ? fn(x) : x) || 0), 0);
+const dashPct = (a, b) => (Number(b) > 0 ? Math.round((Number(a) || 0) / Number(b) * 100) : 0);
+const dashMonth = (v) => String(v == null ? '' : v).slice(0, 7);
+const dashWan = (v) => {
+  const n = Number(v) || 0;
+  return Math.abs(n) >= 10000 ? (n / 10000).toFixed(1) + '万' : String(Math.round(n));
+};
+const dashValueAxis = () => ({
+  type: 'value', splitLine: { lineStyle: { color: '#f1f5f9' } },
+  axisLabel: { color: '#94a3b8', fontSize: 11, formatter: v => v >= 10000 ? (v / 10000) + '万' : v }
+});
+const DASH_AXIS = {
+  axisLine: { lineStyle: { color: '#e2e8f0' } }, axisTick: { show: false },
+  axisLabel: { color: '#94a3b8', fontSize: 11 }
+};
+const DASH_LEGEND = { top: 0, right: 0, icon: 'circle', itemWidth: 7, itemHeight: 7, textStyle: { fontSize: 11, color: '#64748b' } };
+const dashLegend = (names) => Object.assign({}, DASH_LEGEND, { data: names });
+const dashGrid = () => ({ left: 4, right: 8, top: 32, bottom: 0, containLabel: true });
+const dashMonthAxis = (months) => Object.assign({ type: 'category', data: months }, DASH_AXIS, {
+  axisLabel: { color: '#94a3b8', fontSize: 11, formatter: v => String(v).slice(5) + '月' }
+});
+const dashMoneyTip = () => ({ trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: v => money(v) });
+
+function dashMonthKeys(range) {
+  const now = new Date();
+  const n = range === 'ytd' ? now.getMonth() + 1 : (range === '12' ? 12 : 6);
+  const out = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const dt = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    out.push(`${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`);
+  }
+  return out;
+}
+
+/** 全站唯一的经营指标计算入口：数据一变，概览与可视化面板同步更新 */
+function dashMetrics() {
+  const d = S.data || {};
+  const range = S.dashRange === '12' || S.dashRange === 'ytd' ? S.dashRange : '6';
+  const months = dashMonthKeys(range);
+  const building = S.dashBuilding || 'all';
+  const shopsAll = d.shops || [];
+  const billsAll = d.bills || [];
+  const readingsAll = d.readings || [];
+  const equipments = d.equipments || [];
+  const eqLogs = d.equipment_logs || [];
+  const contracts = d.contracts || [];
+  const plans = d.payment_plans || [];
+  const payments = d.payments || [];
+  const t = today(), horizon = addDays(t, 60);
+
+  const allShopRows = shopsAll.map(s => Object.assign({}, s, {
+    building: s.building || '未标注',
+    monthlyRent: shopMonthly(s),
+    unpaid: shopUnpaid(s.id)
+  }));
+  const buildings = Array.from(new Set(allShopRows.map(s => s.building))).sort();
+  const shopRows = building === 'all' ? allShopRows.slice()
+    : allShopRows.filter(s => s.building === building);
+  const shopIds = new Set(shopRows.map(s => s.id));
+  const scoped = (id) => building === 'all' || shopIds.has(Number(id));
+  const bills = billsAll.filter(b => scoped(b.shop_id));
+  const readings = readingsAll.filter(r => scoped(r.shop_id));
+
+  const byBuilding = buildings.map(b => {
+    const list = allShopRows.filter(s => s.building === b);
+    const rented = list.filter(s => s.status === 'rented');
+    return {
+      name: b, total: list.length, rented: rented.length,
+      vacant: list.filter(s => s.status === 'vacant').length,
+      maintenance: list.filter(shopRepairScope).length,
+      area: round2(dashSum(list, s => s.area)),
+      rent: round2(dashSum(rented, s => s.monthlyRent)),
+      arrears: round2(dashSum(list, s => s.unpaid)),
+      rate: dashPct(rented.length, list.length)
+    };
+  });
+  const shopsM = {
+    total: shopRows.length,
+    rented: shopRows.filter(s => s.status === 'rented').length,
+    vacant: shopRows.filter(s => s.status === 'vacant').length,
+    maintenance: shopRows.filter(shopRepairScope).length,
+    area: round2(dashSum(shopRows, s => s.area)),
+    monthlyRent: round2(dashSum(shopRows.filter(s => s.status === 'rented'), s => s.monthlyRent)),
+    potentialRent: round2(dashSum(shopRows, s => s.monthlyRent)),
+    arrearsCount: shopRows.filter(s => s.unpaid > 0).length,
+    arrearsSum: round2(dashSum(shopRows, s => s.unpaid)),
+    leaseExpiring: shopRows.filter(s => s.status === 'rented' && s.lease_end && s.lease_end <= horizon)
+      .sort((a, b) => String(a.lease_end).localeCompare(String(b.lease_end))),
+    rows: shopRows,
+    allRows: allShopRows
+  };
+  shopsM.rate = dashPct(shopsM.rented, shopsM.total);
+  // 1.14.0：与商铺管理统计栏对齐的四类目（在租 / 空置 / 维修 / 欠费）。
+  // 统计栏的「欠费」是跨状态标记；环图为互斥口径，欠费商铺优先归入「欠费」，四类相加 = 商铺总数。
+  // 1.19.0：环图为互斥口径（欠费 > 维修 > 空置 > 在租），「维修」按 shopRepairScope 与统计栏同源
+  const arrearsRows = shopRows.filter(s => s.unpaid > 0);
+  const shopClassOf = (s) => s.unpaid > 0 ? 'arrears'
+    : shopRepairScope(s) ? 'maintenance'
+    : s.status === 'vacant' ? 'vacant' : 'rented';
+  const clsCount = (k) => shopRows.filter(s => shopClassOf(s) === k).length;
+  shopsM.byClass = [
+    { key: 'rented', label: '在租', color: '#059669', count: shopsM.rented, value: clsCount('rented') },
+    { key: 'vacant', label: '空置', color: '#94a3b8', count: shopsM.vacant, value: clsCount('vacant') },
+    { key: 'maintenance', label: '维修', color: '#d97706', count: shopsM.maintenance, value: clsCount('maintenance') },
+    { key: 'arrears', label: '欠费', color: '#dc2626', count: arrearsRows.length, value: arrearsRows.length, amount: shopsM.arrearsSum }
+  ];
+
+  const eqByCategory = Object.keys(CAT).map(k => {
+    const list = equipments.filter(e => e.category === k);
+    return {
+      key: k, label: CAT[k], total: list.length,
+      normal: list.filter(e => e.status === 'normal').length,
+      repair: list.filter(e => e.status === 'repair').length,
+      stopped: list.filter(e => e.status === 'stopped').length
+    };
+  });
+  const eqM = {
+    total: equipments.length,
+    normal: equipments.filter(e => e.status === 'normal').length,
+    repair: equipments.filter(e => e.status === 'repair').length,
+    stopped: equipments.filter(e => e.status === 'stopped').length,
+    abnormal: equipments.filter(e => e.status === 'repair' || e.status === 'stopped').length,
+    due: equipments.filter(maintainWarn),
+    byCategory: eqByCategory
+  };
+  eqM.healthy = dashPct(eqM.normal, eqM.total);
+
+  const paidFromFlow = (cid) => dashSum(payments.filter(p => Number(p.contract_id) === Number(cid)), p => p.amount);
+  const contractRows = contracts.map(c => {
+    const paid = (c.summary && Number(c.summary.paid)) || paidFromFlow(c.id) || 0;
+    return Object.assign({}, c, {
+      paid: round2(paid),
+      unpaid: Math.max(0, round2((Number(c.amount) || 0) - paid))
+    });
+  });
+  const groupCount = (key, map) => Object.keys(map).map(k => ({
+    key: k, label: map[k][0] || map[k], count: contractRows.filter(c => c[key] === k).length,
+    amount: round2(dashSum(contractRows.filter(c => c[key] === k), c => c.amount))
+  }));
+  const contractM = {
+    total: contractRows.length,
+    ongoing: contractRows.filter(c => c.status === 'ongoing' || c.status === 'paused').length,
+    amountTotal: round2(dashSum(contractRows, c => c.amount)),
+    paidTotal: round2(dashSum(contractRows, c => c.paid)),
+    unpaidTotal: round2(dashSum(contractRows, c => c.unpaid)),
+    progressAvg: contractRows.length ? Math.round(dashSum(contractRows, c => c.progress) / contractRows.length) : 0,
+    byStatus: groupCount('status', CONTRACT_STATUS),
+    byCategory: Object.keys(CATEGORY_CONTRACT).map(k => ({
+      key: k, label: CATEGORY_CONTRACT[k], count: contractRows.filter(c => c.category === k).length,
+      amount: round2(dashSum(contractRows.filter(c => c.category === k), c => c.amount))
+    })),
+    rows: contractRows
+  };
+  contractM.paidRatio = dashPct(contractM.paidTotal, contractM.amountTotal);
+
+  const planRows = plans.map(p => Object.assign({}, p, {
+    amount: Number(p.amount) || 0, due: p.due_date || ''
+  }));
+  const overduePlans = planRows.filter(p => p.status !== 'paid' && p.due && p.due < t)
+    .sort((a, b) => a.due.localeCompare(b.due));
+  const planM = {
+    paid: planRows.filter(p => p.status === 'paid').length,
+    pending: planRows.filter(p => p.status !== 'paid').length,
+    overdue: overduePlans,
+    overdueAmount: round2(dashSum(overduePlans, p => p.amount)),
+    upcoming: planRows.filter(p => p.status !== 'paid' && p.due && p.due >= t && p.due <= horizon),
+    rows: planRows
+  };
+
+  const unpaidBills = bills.filter(b => b.status !== 'paid');
+  const billingM = {
+    count: bills.length,
+    paidCount: bills.filter(b => b.status === 'paid').length,
+    unpaidCount: unpaidBills.length,
+    unpaidSum: round2(dashSum(unpaidBills, b => b.total)),
+    collectRate: dashPct(bills.filter(b => b.status === 'paid').length, bills.length),
+    leaseCount: shopsM.leaseExpiring.length,
+    byMonth: months.map(m => ({
+      month: m,
+      due: round2(dashSum(bills.filter(b => dashMonth(b.period) === m), b => b.total)),
+      paid: round2(dashSum(bills.filter(b => b.status === 'paid' && dashMonth(b.paid_date) === m), b => b.total))
+    }))
+  };
+  billingM.byMonth.forEach(x => { x.rate = dashPct(x.paid, x.due); });
+
+  const cashflow = months.map(m => ({
+    month: m,
+    income: round2(dashSum(bills.filter(b => b.status === 'paid' && dashMonth(b.paid_date) === m), b => b.total)),
+    outcome: round2(dashSum(payments.filter(p => dashMonth(p.pay_date) === m), p => p.amount))
+  }));
+  cashflow.forEach(x => { x.net = round2(x.income - x.outcome); });
+
+  const utility = months.map(m => {
+    const rs = readings.filter(r => dashMonth(r.period) === m);
+    return {
+      month: m,
+      water: round2(dashSum(rs, r => r.water_usage)),
+      elec: round2(dashSum(rs, r => r.elec_usage)),
+      waterFee: round2(dashSum(rs, r => r.water_fee)),
+      elecFee: round2(dashSum(rs, r => r.elec_fee))
+    };
+  });
+  const maintainCost = months.map(m => ({
+    month: m,
+    cost: round2(dashSum(eqLogs.filter(l => dashMonth(l.log_date) === m), l => l.cost))
+  }));
+  const dueTrend = months.map(m => ({
+    month: m,
+    due: round2(dashSum(planRows.filter(p => dashMonth(p.due) === m && p.status !== 'paid'), p => p.amount)),
+    paid: round2(dashSum(payments.filter(p => dashMonth(p.pay_date) === m), p => p.amount)),
+    overdue: round2(dashSum(overduePlans.filter(p => dashMonth(p.due) === m), p => p.amount))
+  }));
+
+  const contractName = (cid) => {
+    const c = contractRows.find(x => Number(x.id) === Number(cid));
+    return c ? c.name : '工程合同';
+  };
+  const risk = [];
+  overduePlans.slice(0, 5).forEach(p => risk.push({
+    level: 'danger', title: `付款逾期 · ${p.name}`,
+    desc: `${contractName(p.contract_id)} · ${moneyShort(p.amount)} · 应付 ${p.due}`, type: 'overdue', key: ''
+  }));
+  shopRows.filter(s => s.unpaid > 0).sort((a, b) => b.unpaid - a.unpaid).slice(0, 4).forEach(s => risk.push({
+    level: 'warn', title: `商铺欠费 · ${s.name}`,
+    desc: `${s.building} ${s.floor || ''} · 未收款 ${moneyShort(s.unpaid)}`, type: 'arrears', key: ''
+  }));
+  eqM.due.slice(0, 3).forEach(e => risk.push({
+    level: maintainLate(e) ? 'danger' : 'warn',
+    title: `${maintainLate(e) ? '保养已到期' : '临近保养'} · ${e.name}`,
+    desc: `计划 ${e.next_maintain}${e.location ? ' · ' + e.location : ''}`, type: 'maintain', key: ''
+  }));
+  equipments.filter(e => e.status === 'repair').slice(0, 3).forEach(e => risk.push({
+    level: 'warn', title: `设备维修中 · ${e.name}`,
+    desc: `${CAT[e.category] || ''} ${e.location || ''}`, type: 'repair', key: ''
+  }));
+  shopsM.leaseExpiring.slice(0, 2).forEach(s => risk.push({
+    level: 'info', title: `租约临近到期 · ${s.name}`,
+    desc: `${s.lease_end} · ${s.tenant || '未登记租户'}`, type: 'lease', key: ''
+  }));
+  shopRows.filter(s => s.status === 'vacant').slice(0, 2).forEach(s => risk.push({
+    level: 'info', title: `商铺空置 · ${s.name}`,
+    desc: `${s.building} ${s.floor || ''} · ${num(s.area)} ㎡`, type: 'vacant', key: ''
+  }));
+
+  return {
+    range, months, building, buildings,
+    scopeLabel: building === 'all' ? '全项目口径' : `楼栋口径：${building}`,
+    dataCount: shopsAll.length + billsAll.length + readingsAll.length + equipments.length
+      + eqLogs.length + contracts.length + plans.length + payments.length,
+    shops: shopsM, equipments: eqM, contracts: contractM, plans: planM,
+    billing: billingM, cashflow, utility, maintainCost, dueTrend,
+    totalMaintain: round2(dashSum(maintainCost, x => x.cost)),
+    netCash: round2(dashSum(cashflow, x => x.net)),
+    byBuilding, risk,
+    raw: { bills, readings, payments, plans: planRows, contracts: contractRows, equipments, eqLogs }
+  };
+}
+
+/* ---------- 驾驶舱组件（1.17.0 合并概览与可视化面板） ---------- */
+/** 合并后按分析维度分区，避免一页堆满十余张图；每个分区只挂载当前存在的图表 */
+const COCKPIT_TABS = [
+  { k: 'overview', n: '经营总览', tip: '经营收支、资产结构、在建工程与风险待办' },
+  { k: 'assets', n: '资产与租赁', tip: '楼栋出租结构、租金欠费、商铺资产结构与合同结构' },
+  { k: 'finance', n: '经营与收支', tip: '收支趋势、账单收缴、水电费用与付款节点到期' },
+  { k: 'engineering', n: '设备与工程', tip: '设备状态、合同付款执行、在建工程与合同结构' }
+];
+function cockpitTabKey() {
+  return COCKPIT_TABS.some(t => t.k === S.cockpitTab) ? S.cockpitTab : 'overview';
+}
+function cockpitTabHtml() {
+  const cur = COCKPIT_TABS.find(t => t.k === cockpitTabKey()) || COCKPIT_TABS[0];
+  return `<div class="dash-tabs" id="dashTabs">
+    <span class="dt-label">分析维度</span>
+    ${COCKPIT_TABS.map(t => `<button class="dt ${t.k === cur.k ? 'active' : ''}" data-act="dashTab" data-k="${t.k}" title="${esc(t.tip)}">${t.n}</button>`).join('')}
+    <span class="spacer"></span><span class="dt-tip">${esc(cur.tip)}</span>
+  </div>`;
+}
+
+/** 补充指标：原先 6 个独立 KPI 块压成一条紧凑指标带，给图表让出首屏空间 */
+function dashStatStrip(o) {
+  const stats = [
+    ['账单收缴率', `${o.billing.collectRate}%`, `${o.billing.paidCount}/${o.billing.count} 笔已收款`],
+    ['本期净现金流', moneyShort(o.netCash), `收款 ${moneyShort(dashSum(o.cashflow, x => x.income))}`],
+    ['维保费用', moneyShort(o.totalMaintain), `近 ${o.months.length} 个月累计`],
+    ['租约 60 天内到期', `${o.shops.leaseExpiring.length} 间`, `在租 ${o.shops.rented} 间`],
+    ['未付付款节点', `${o.plans.pending} 笔`, `逾期 ${o.plans.overdue.length} 笔`],
+    ['水电费用', moneyShort(dashSum(o.utility, x => x.waterFee + x.elecFee)), `抄表 ${o.raw.readings.length} 条`]
+  ];
+  return `<div class="dash-stat">${stats.map(([k, v, sub]) =>
+    `<div class="ds"><span class="ds-k">${esc(k)}</span><b class="ds-v">${v}</b><span class="ds-t">${esc(sub)}</span></div>`).join('')}</div>`;
+}
+
+const chartCard = (id, title, sub, short) => `<div class="dcard">
+  <div class="dh"><h3>${esc(title)}</h3><span class="spacer"></span><span class="sub">${esc(sub)}</span></div>
+  <div class="db"><div id="${id}" class="dchart${short ? ' short' : ''}"></div></div></div>`;
+
+function cashCard(o) {
+  return `<div class="dcard">
+    <div class="dh"><h3>经营收支趋势</h3><span class="sub">近 ${o.months.length} 个月 · 商铺收款 / 工程付款 / 净现金流</span>
+      <span class="spacer"></span><span class="sub">点击柱子查看当月明细</span></div>
+    <div class="db"><div id="chartCash" class="dchart tall"></div></div></div>`;
+}
+function assetPieCard(o) {
+  return `<div class="dcard">
+    <div class="dh"><h3>商铺资产结构</h3><span class="sub">共 ${o.shops.total} 间 · ${num(o.shops.area)} ㎡ · 类目与商铺管理一致</span></div>
+    <div class="db"><div id="chartEq" class="dchart tall"></div></div>
+    <div class="dash-cats">${shopClassChips(o)}</div>
+    <div class="dcat-note">环图按「欠费优先」拆为互斥四类，合计 = 商铺总数；四类目数值与商铺管理统计栏同源。点击类目或扇区查看明细，切到商铺管理时自动带上对应筛选。</div>
+  </div>`;
+}
+function projCard(o) {
+  return `<div class="dcard">
+    <div class="dh"><h3>在建工程</h3><span class="sub">进度与资金执行 · ${o.contracts.ongoing} 项</span>
+      <span class="spacer"></span><button class="btn-link" data-act="nav" data-view="contracts">全部合同 →</button></div>
+    <div class="db" style="max-height:266px;overflow:auto">${dashProjList(o)}</div></div>`;
+}
+function riskCard(o) {
+  return `<div class="dcard">
+    <div class="dh"><h3>风险与待办</h3><span class="sub">${o.risk.length} 项 · 点击查看明细</span>
+      <span class="spacer"></span><span class="sub">按紧急程度排序</span></div>
+    ${dashRiskList(o)}</div>`;
+}
+
+/** 概览资产结构环图数据：四类互斥，颜色与商铺管理统计栏一致 */
+function shopPieData(o) {
+  return o.shops.byClass.map(c => ({
+    name: c.label, value: c.value, itemStyle: { color: c.color }
+  }));
+}
+
+/** 资产结构卡下方四类目：数值口径与商铺管理统计栏完全相同 */
+function shopClassChips(o) {
+  return o.shops.byClass.map(c => {
+    const val = c.key === 'arrears' ? moneyShort(c.amount) : `${c.count} 间`;
+    const tip = c.key === 'arrears'
+      ? `共 ${c.count} 间商铺欠费，合计 ${money(c.amount)}`
+      : `共 ${c.count} 间`;
+    return `<button class="dcat${c.key === 'arrears' && c.amount > 0 ? ' warn' : ''}" data-act="dashCat" data-k="${c.key}" title="${esc(tip)}"><i class="dot" style="background:${c.color}"></i>${c.label}<b>${val}</b></button>`;
+  }).join('');
+}
+
+function dashHero(o) {
+  const s = S.settings || {};
+  const proj = String(s.project_name || s.org_name || '物业工程管理').trim();
+  const tab = COCKPIT_TABS.find(t => t.k === cockpitTabKey()) || COCKPIT_TABS[0];
+  return `<div class="dash-hero">
+    <div class="dh-main">
+      <h2>${esc(proj)} · 可视化驾驶舱</h2>
+      <p>${esc(tab.n)}视角 · 全部指标实时取自现有业务数据（${esc(o.scopeLabel)}）· 共 ${num(o.dataCount)} 条记录，数据变更后刷新即更新</p>
+    </div>
+    <div class="dh-tools">
+      <div class="dh-seg">${DASH_RANGES.map(r =>
+        `<button class="${o.range === r.k ? 'active' : ''}" data-act="dashRange" data-k="${r.k}">${r.n}</button>`).join('')}</div>
+      <span class="dh-meta"><span class="dh-dot"></span>${esc(today())} 实时</span>
+    </div>
+  </div>
+  <div class="toolbar" style="margin-bottom:14px">
+    <span style="font-size:11.5px;color:var(--faint)">楼栋范围</span>
+    <div class="chips">
+      <button class="chip ${o.building === 'all' ? 'active' : ''}" data-act="dashBuilding" data-k="all">全项目<b>${o.shops.allRows.length}</b></button>
+      ${o.byBuilding.map(b => `<button class="chip ${o.building === b.name ? 'active' : ''}" data-act="dashBuilding" data-k="${esc(b.name)}">${esc(b.name)}<b>${b.total}</b></button>`).join('')}
+    </div>
+    <span class="spacer"></span>
+    <span style="font-size:11px;color:var(--faint)">商铺 / 账单 / 抄表随楼栋联动，设备与合同为全项目口径</span>
+    ${S.dashDrill ? `<button class="btn btn-sm" data-act="dashClear">清除下钻</button>` : ''}
+  </div>`;
+}
+
+function dashKpiCard(cfg) {
+  const target = { shops: '商铺管理', equipments: '设备管理', contracts: '项目合同管理', payments: '项目付款台帐' }[cfg.view] || '';
+  return `<div class="dk" style="--dk-color:${cfg.color};--dk-soft:${cfg.soft}" data-act="dashGo" data-view="${cfg.view}" data-filter="${cfg.filter || ''}" title="点击进入${esc(target)}查看明细">
+    <div class="dk-lbl">${esc(cfg.label)}</div>
+    <div class="dk-val">${cfg.val}</div>
+    <div class="dk-sub">${cfg.sub}</div>
+    <div class="dk-bar"><i style="width:${clamp(cfg.bar, 0, 100)}%"></i></div>
+    ${cfg.tag ? `<span class="dk-tag">${esc(cfg.tag)}</span>` : ''}
+  </div>`;
+}
+
+function dashKpiGrid(o) {
+  const s = o.shops, e = o.equipments, c = o.contracts, p = o.plans, b = o.billing;
+  const cards = [
+    {
+      label: '商铺出租率', val: `${s.rate}<small>%</small>`,
+      sub: `在租 ${s.rented} 间 · 维修 ${s.maintenance} / 欠费 ${s.arrearsCount} 间`,
+      bar: s.rate, color: '#2563eb', soft: '#eff6ff', tag: `${s.total} 间`, view: 'shops', filter: 'all'
+    },
+    {
+      label: '在租月租金', val: moneyShort(s.monthlyRent),
+      sub: `可租面积 ${num(s.area)} ㎡ · 满租 ${moneyShort(s.potentialRent)}`,
+      bar: dashPct(s.monthlyRent, s.potentialRent), color: '#059669', soft: '#ecfdf5',
+      tag: '月度', view: 'shops', filter: 'rented'
+    },
+    {
+      label: '商铺欠费', val: moneyShort(s.arrearsSum),
+      sub: `${s.arrearsCount} 间 · ${b.unpaidCount} 笔未收款账单`,
+      bar: dashPct(s.arrearsSum, s.monthlyRent || 1), color: '#dc2626', soft: '#fef2f2',
+      tag: '待催收', view: 'shops', filter: 'arrears'
+    },
+    {
+      label: '设备完好率', val: `${e.healthy}<small>%</small>`,
+      sub: `异常 ${e.abnormal} 台 · 保养到期 ${e.due.length} 台`,
+      bar: e.healthy, color: '#0891b2', soft: '#ecfeff', tag: `${e.total} 台`,
+      view: 'equipments', filter: 'repair'
+    },
+    {
+      label: '合同付款执行', val: `${c.paidRatio}<small>%</small>`,
+      sub: `已付 ${moneyShort(c.paidTotal)} / ${moneyShort(c.amountTotal)}`,
+      bar: c.paidRatio, color: '#7c3aed', soft: '#f5f3ff', tag: `${c.total} 份`,
+      view: 'contracts', filter: 'ongoing'
+    },
+    {
+      label: '逾期付款节点', val: `${p.overdue.length}<small>笔</small>`,
+      sub: `逾期 ${moneyShort(p.overdueAmount)} · 待付 ${moneyShort(c.unpaidTotal)}`,
+      bar: dashPct(p.overdue.length, p.pending || 1), color: '#ea580c', soft: '#fff7ed',
+      tag: p.overdue.length ? '需处理' : '正常', view: 'payments', filter: 'overdue'
+    }
+  ];
+  return `<div class="dk-grid">${cards.map(dashKpiCard).join('')}</div>`;
+}
+
+function dashRiskList(o) {
+  if (!o.risk.length) return `<div class="empty">暂无风险，一切正常</div>`;
+  return `<div class="risk-list">${o.risk.map(r => `
+    <div class="risk" data-act="dashDrill" data-type="${r.type}" data-k="${esc(r.key)}" title="点击查看对应业务明细">
+      <div class="ic ${r.level}">${r.level === 'danger' ? '!' : r.level === 'warn' ? '·' : 'i'}</div>
+      <div><div class="tt">${esc(r.title)}</div><div class="ts">${esc(r.desc)}</div></div>
+    </div>`).join('')}</div>`;
+}
+
+function dashProjList(o) {
+  const list = o.contracts.rows.filter(c => c.status === 'ongoing' || c.status === 'paused');
+  if (!list.length) return `<div class="empty">暂无在建工程</div>`;
+  return list.map(c => {
+    const ratio = c.amount ? Math.round(c.paid / c.amount * 100) : 0;
+    return `<div class="proj" data-act="contract" data-id="${c.id}">
+      <div class="pt"><span class="pn">${esc(c.name)}</span>
+        <span class="pill ${c.status === 'paused' ? 'warn' : 'info'}">${c.status === 'paused' ? '暂停' : '施工中'}</span>
+        <span class="pa">${money(c.amount)}</span></div>
+      <div class="ps">${esc(c.contractor || '—')} · 工期 ${esc(c.start_date || '—')} 至 ${esc(c.end_date || '—')} · 已付 ${money(c.paid)}</div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <div class="bar" style="flex:1"><i style="width:${clamp(c.progress || 0, 0, 100)}%"></i></div>
+        <span style="font-size:11.5px;color:var(--muted);width:34px;text-align:right">${c.progress || 0}%</span>
+        <span style="font-size:11px;color:var(--faint);width:78px;text-align:right">付款 ${ratio}%</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/** 点击图表 / 风险条目后的明细下钻：全部来自现有业务记录 */
+function dashDrillHtml(o) {
+  const dr = S.dashDrill;
+  if (!dr) return `<div class="drill-empty">点击上方图表的柱 / 扇区 / 数据点，或「风险与待办」中的条目，即可在此查看对应的原始业务记录。<br>例如：点击某个月份查看当月账单、工程付款与水电抄表；点击某个楼栋查看该楼栋全部商铺。</div>`;
+  const type = dr.type, key = dr.key || '';
+  const shopHead = ['编号', '商铺', '楼栋 / 楼层', '状态', '面积', '月租金', '欠费', '租约到期'];
+  const eqHead = ['编号', '设备', '分类', '状态', '位置', '下次保养'];
+  const line = (act, id, cells, view) => `<tr ${view ? `data-act="${act}" data-view="${view}"` : `data-act="${act}" data-id="${id}"`}>${cells.map(c => `<td>${c}</td>`).join('')}</tr>`;
+  const shopLine = (s) => line('shop', s.id, [
+    esc(s.code || '—'), esc(s.name), esc(s.building + ' ' + (s.floor || '')),
+    esc((SHOP_STATUS[s.status] || ['未知'])[0]), num(s.area) + ' ㎡', money(s.monthlyRent),
+    s.unpaid > 0 ? `<span style="color:var(--red)">${money(s.unpaid)}</span>` : '—',
+    esc(s.lease_end || '—')
+  ]);
+  const eqLine = (e) => line('eq', e.id, [
+    esc(e.code || '—'), esc(e.name), esc(CAT[e.category] || '其他'),
+    esc((EQ_STATUS[e.status] || ['未知'])[0]), esc(e.location || '—'), esc(e.next_maintain || '—')
+  ]);
+  const contractLine = (c) => line('contract', c.id, [
+    esc(c.name), esc(c.contractor || '—'), esc((CONTRACT_STATUS[c.status] || ['未知'])[0]),
+    money(c.amount), money(c.paid), `${c.progress || 0}%`
+  ]);
+  const planLine = (p) => line('nav', '', [
+    `第 ${p.seq || 1} 期`, esc(p.name), esc((o.contracts.rows.find(c => Number(c.id) === Number(p.contract_id)) || {}).name || '—'),
+    money(p.amount), esc(p.due || '—'), esc((PLAN_STATUS[p.status] || ['未知'])[0])
+  ], 'payments');
+  const shopName = (id) => (o.shops.allRows.find(s => Number(s.id) === Number(id)) || {}).name || '商铺';
+  const wrap = (title, head, rows) => `<div class="drill-head">
+      <span class="tag">${esc(title)}</span>
+      <span style="font-size:11.5px;color:var(--faint)">${rows.length} 条记录 · 点击行打开对应业务详情</span>
+      <span class="spacer"></span><button class="btn btn-sm" data-act="dashClear">清除</button>
+    </div>` + (rows.length
+      ? `<div class="drill-wrap"><table><thead><tr>${head.map(x => `<th>${esc(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`
+      : `<div class="drill-empty">该维度暂无记录</div>`);
+
+  if (type === 'building') {
+    const list = o.shops.allRows.filter(s => s.building === key);
+    return wrap(`${key} · 商铺明细`, shopHead, list.map(shopLine));
+  }
+  if (type === 'shopStatus') {
+    // 1.19.0：「维修」下钻与统计栏同口径（经营业态维修 ∪ 维修工程进行中）
+    const list = key === '维修'
+      ? o.shops.allRows.filter(shopRepairScope)
+      : o.shops.allRows.filter(s => (SHOP_STATUS[s.status] || [''])[0] === key || s.status === key);
+    return wrap(`${key || '全部'} · 商铺明细`, shopHead, list.map(shopLine));
+  }
+  if (type === 'arrears' || type === 'lease' || type === 'vacant') {
+    const list = type === 'arrears' ? o.shops.allRows.filter(s => s.unpaid > 0)
+      : type === 'lease' ? o.shops.leaseExpiring
+      : o.shops.allRows.filter(s => s.status === 'vacant');
+    return wrap(`${DRILL_LABEL[type]} · 共 ${list.length} 间`, shopHead, list.map(shopLine));
+  }
+  if (type === 'eqCat' || type === 'repair' || type === 'maintain') {
+    const list = type === 'eqCat' ? o.raw.equipments.filter(e => (CAT[e.category] || '其他') === key || e.category === key)
+      : type === 'repair' ? o.raw.equipments.filter(e => e.status === 'repair')
+      : o.equipments.due;
+    return wrap(`${key || DRILL_LABEL[type]} · 设备明细`, eqHead, list.map(eqLine));
+  }
+  if (type === 'contract') {
+    const list = o.contracts.rows.filter(c => (c.name || '') === key);
+    return wrap(`${key || '工程合同'} · 合同明细`, ['合同名称', '施工方', '状态', '合同金额', '已付款', '进度'], list.map(contractLine));
+  }
+  if (type === 'overdue' || type === 'plan') {
+    const list = type === 'overdue' ? o.plans.overdue : o.plans.rows.filter(p => p.status !== 'paid');
+    return wrap(`${DRILL_LABEL[type]} · 共 ${list.length} 笔`, ['期次', '付款节点', '所属合同', '应付金额', '应付日期', '状态'], list.map(planLine));
+  }
+  if (type === 'bill') {
+    const list = o.raw.bills.filter(b => b.status !== 'paid');
+    const rows = list.map(b => line('shop', b.shop_id, [
+      esc(b.period || '—'), esc(shopName(b.shop_id)), money(b.total),
+      esc(b.status === 'paid' ? '已收款' : '未收款'), esc(b.paid_date || '—')
+    ]));
+    return wrap('未收款账单明细', ['账期', '商铺', '金额', '状态', '收款日期'], rows);
+  }
+  if (type === 'utility') {
+    const m = key || o.months[o.months.length - 1];
+    const list = o.raw.readings.filter(r => dashMonth(r.period) === m);
+    const rows = list.map(r => line('shop', r.shop_id, [
+      esc(r.period || m), esc(shopName(r.shop_id)), num(r.water_usage) + ' 吨',
+      num(r.elec_usage) + ' 度', money((Number(r.water_fee) || 0) + (Number(r.elec_fee) || 0)), esc(r.read_date || '—')
+    ]));
+    return wrap(`${m} · 水电抄表明细`, ['账期', '商铺', '用水量', '用电量', '水电费', '抄表日期'], rows);
+  }
+  if (type === 'month') {
+    const m = key || o.months[o.months.length - 1];
+    const bs = o.raw.bills.filter(b => dashMonth(b.period) === m || (b.status === 'paid' && dashMonth(b.paid_date) === m));
+    const ps = o.raw.payments.filter(p => dashMonth(p.pay_date) === m);
+    const rs = o.raw.readings.filter(r => dashMonth(r.period) === m);
+    const rows = [
+      ...bs.map(b => line('shop', b.shop_id, [
+        esc(b.period || m), '商铺账单', esc(shopName(b.shop_id)), money(b.total),
+        esc(b.status === 'paid' ? '已收款' : '未收款')
+      ])),
+      ...ps.map(p => line('nav', '', [
+        esc(p.pay_date || m), '工程付款',
+        esc((o.contracts.rows.find(c => Number(c.id) === Number(p.contract_id)) || {}).name || '工程合同'),
+        money(p.amount), '已支付'
+      ], 'payments')),
+      ...rs.map(r => line('shop', r.shop_id, [
+        esc(r.period || m), '水电抄表', esc(shopName(r.shop_id)),
+        `${num(r.water_usage)} 吨 / ${num(r.elec_usage)} 度`,
+        money((Number(r.water_fee) || 0) + (Number(r.elec_fee) || 0))
+      ]))
+    ];
+    return wrap(`${m} · 经营明细`, ['日期 / 账期', '类型', '对象', '金额 / 用量', '状态 / 费用'], rows);
+  }
+  return `<div class="drill-empty">暂无可查看的明细</div>`;
+}
+
+function setDashDrill(type, key) {
+  S.dashDrill = { type: type || 'month', key: key || '', label: DRILL_LABEL[type] || '明细' };
+  render();
+  const el = document.getElementById('dashDrill');
+  if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/** KPI 卡跳转：带上对应模块的筛选条件，实现「面板 → 业务台账」联动 */
+function dashGo(view, filter) {
+  const f = filter || '';
+  if (view === 'shops') S.shopStatus = normalizeShopStatus(f);
+  if (view === 'payments') S.payFilter = ['all', 'pending', 'due', 'paid', 'overdue'].includes(f) ? f : 'all';
+  if (view === 'contracts') S.contractStatus = ['all', 'draft', 'ongoing', 'paused', 'done', 'settled'].includes(f) ? f : 'all';
+  if (view === 'equipments') {
+    S.eqCat = CAT[f] ? f : 'all';
+    S.eqQuery = f === 'repair' ? '维修中' : '';
+    S.eqMaintain = 'all';
+  }
+  setView(view);
+  render();
+}
+
+function dashDrillCard(o) {
+  return `<div class="dcard" id="dashDrill" style="margin-bottom:14px">
+    <div class="dh"><h3>经营明细下钻</h3><span class="sub">来自现有业务表，可逐条追溯 · 点击图表 / 风险条目联动，点击明细行直达档案</span></div>
+    <div class="db">${dashDrillHtml(o)}</div>
+  </div>`;
+}
+
+/* ============================================================
+   可视化驾驶舱（1.17.0：概览 + 可视化面板合并）
+   经营快照 / KPI / 指标带常驻，图表按「分析维度」分区展示；
+   下钻区常驻底部，任何分区点图都能在此追溯原始业务记录。
+   ============================================================ */
+function cockpitSection(o, tab) {
+  if (tab === 'assets') {
+    return `<div class="dash-grid">
+      ${chartCard('dbShop', '楼栋出租结构', '间数 + 出租率')}
+      ${chartCard('dbRent', '各楼栋月租金与欠费', '在租商铺测算')}
+      ${assetPieCard(o)}
+      ${chartCard('dbContract', '合同结构', '按状态 / 类型汇总', true)}
+    </div>`;
+  }
+  if (tab === 'finance') {
+    return `<div class="dash-grid">
+      ${cashCard(o)}
+      ${chartCard('dbBill', '账单收缴趋势', '应收 / 实收 / 收缴率')}
+      ${chartCard('dbUtil', '水电用量与费用', '抄表记录实时汇总')}
+      ${chartCard('dbDue', '付款节点到期分布', '计划应付 / 实付 / 逾期')}
+    </div>`;
+  }
+  if (tab === 'engineering') {
+    return `<div class="dash-grid">
+      ${chartCard('dbEq', '设备分类与状态', `${o.equipments.total} 台 · 完好率 ${o.equipments.healthy}%`)}
+      ${chartCard('dbPay', '合同付款执行', `已付 / 未付 · 金额前 ${Math.min(6, o.contracts.total)} 份`)}
+      ${chartCard('dbContract', '合同结构', '按状态 / 类型汇总', true)}
+      ${projCard(o)}
+    </div>`;
+  }
+  return `<div class="dash-row a">${cashCard(o)}${assetPieCard(o)}</div>
+    <div class="dash-row b">${projCard(o)}${riskCard(o)}</div>`;
+}
+
+function viewCockpit() {
+  const o = dashMetrics();
+  return `${dashHero(o)}
+  ${dashKpiGrid(o)}
+  ${dashStatStrip(o)}
+  ${cockpitTabHtml()}
+  ${cockpitSection(o, cockpitTabKey())}
+  <p class="dash-note">全部图表由商铺档案、费用账单、水电抄表、设备台账与维保记录、工程合同、付款计划与付款流水实时计算；切换分析维度、时间范围或楼栋后自动重算。点击任意柱 / 扇区 / 数据点或风险条目，可在下方查看原始记录，点击明细行直接打开档案。</p>
+  ${dashDrillCard(o)}`;
+}
+
+/** 兼容旧入口 / 旧书签：概览与可视化面板已合并，两者均指向同一驾驶舱 */
+function viewOverview() { return viewCockpit(); }
+function viewDashboard() { return viewCockpit(); }
+
+/* ============================================================
+   图表挂载
+   ============================================================ */
+function disposeCharts() {
+  S.charts.forEach(c => { try { c.dispose(); } catch (e) {} });
+  S.charts = [];
+}
+
+/** 初始化一张图并绑定「点击 → 明细下钻」 */
+function dashChart(id, option, drillType) {
+  if (typeof echarts === 'undefined') return null;
+  const el = document.getElementById(id);
+  if (!el) return null;
+  const c = echarts.init(el, null, { renderer: 'canvas' });
+  c.setOption(option);
+  S.charts.push(c);
+  if (drillType && typeof c.on === 'function') {
+    c.on('click', (p) => {
+      const name = String((p && (p.name || (p.data && p.data.name))) || '');
+      setTimeout(() => {
+        // 允许图表自定义下钻目标（例如资产结构环图的「欠费」扇区）
+        if (typeof drillType === 'function') drillType(name, p);
+        else setDashDrill(drillType, name);
+      }, 0);
+    });
+  }
+  return c;
+}
+
+/** 1.17.0：合并后唯一的图表挂载入口；只初始化当前分析维度里真实存在的容器 */
+function mountCockpitCharts() {
+  if (typeof echarts === 'undefined') return;
+  const o = dashMetrics();
+  const months = o.months, bs = o.byBuilding;
+
+  // 经营收支趋势（概览与收支分区共用一张图，不再重复两版）
+  dashChart('chartCash', {
+    tooltip: dashMoneyTip(), legend: dashLegend(['商铺收款', '工程付款', '净现金流']),
+    grid: dashGrid(), xAxis: dashMonthAxis(months), yAxis: dashValueAxis(),
+    series: [
+      { name: '商铺收款', type: 'line', smooth: true, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2, color: '#059669' }, itemStyle: { color: '#059669' }, areaStyle: { color: 'rgba(5,150,105,.08)' }, data: o.cashflow.map(x => x.income) },
+      { name: '工程付款', type: 'bar', barMaxWidth: 20, itemStyle: { color: '#f59e0b', borderRadius: [3, 3, 0, 0] }, data: o.cashflow.map(x => x.outcome) },
+      { name: '净现金流', type: 'line', smooth: true, symbol: 'circle', symbolSize: 4, lineStyle: { width: 1.5, type: 'dashed', color: '#2563eb' }, itemStyle: { color: '#2563eb' }, data: o.cashflow.map(x => x.net) }
+    ]
+  }, 'month');
+
+  const s = o.shops;
+  dashChart('chartEq', {
+    tooltip: { trigger: 'item', formatter: p => `${p.name}<br/>${p.value} 间（${p.percent}%）` },
+    legend: { bottom: 0, icon: 'circle', itemWidth: 7, itemHeight: 7, textStyle: { fontSize: 11, color: '#64748b' } },
+    series: [{
+      type: 'pie', radius: ['52%', '74%'], center: ['50%', '46%'],
+      itemStyle: { borderColor: '#fff', borderWidth: 3 },
+      label: {
+        show: true, position: 'center',
+        formatter: () => `{a|${s.rate}%}\n{b|出租率}`,
+        rich: { a: { fontSize: 24, fontWeight: 700, color: '#0f172a' }, b: { fontSize: 11, color: '#94a3b8', padding: [4, 0, 0, 0] } }
+      },
+      labelLine: { show: false },
+      data: shopPieData(o)
+    }]
+  }, (name) => setDashDrill(name === '欠费' ? 'arrears' : 'shopStatus', name === '欠费' ? '' : name));
+
+  // 1. 楼栋出租结构（堆叠柱 + 出租率折线）
+  dashChart('dbShop', {
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: dashLegend(['在租', '空置', '维修', '出租率']), grid: dashGrid(),
+    xAxis: Object.assign({ type: 'category', data: bs.map(b => b.name) }, DASH_AXIS),
+    yAxis: [
+      Object.assign(dashValueAxis(), { minInterval: 1 }),
+      { type: 'value', min: 0, max: 100, splitLine: { show: false }, axisLabel: { color: '#94a3b8', fontSize: 11, formatter: '{value}%' } }
+    ],
+    series: [
+      { name: '在租', type: 'bar', stack: 'shop', barMaxWidth: 34, itemStyle: { color: '#059669' }, data: bs.map(b => b.rented) },
+      { name: '空置', type: 'bar', stack: 'shop', itemStyle: { color: '#cbd5e1' }, data: bs.map(b => b.vacant) },
+      { name: '维修', type: 'bar', stack: 'shop', itemStyle: { color: '#f59e0b', borderRadius: [3, 3, 0, 0] }, data: bs.map(b => b.maintenance) },
+      { name: '出租率', type: 'line', yAxisIndex: 1, smooth: true, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2, color: '#2563eb' }, itemStyle: { color: '#2563eb' }, data: bs.map(b => b.rate) }
+    ]
+  }, 'building');
+
+  // 2. 楼栋月租金与欠费
+  dashChart('dbRent', {
+    tooltip: dashMoneyTip(), legend: dashLegend(['在租月租金', '欠费金额']), grid: dashGrid(),
+    xAxis: Object.assign({ type: 'category', data: bs.map(b => b.name) }, DASH_AXIS), yAxis: dashValueAxis(),
+    series: [
+      { name: '在租月租金', type: 'bar', barMaxWidth: 24, itemStyle: { color: '#2563eb', borderRadius: [3, 3, 0, 0] }, label: { show: true, position: 'top', color: '#64748b', fontSize: 10, formatter: p => dashWan(p.value) }, data: bs.map(b => b.rent) },
+      { name: '欠费金额', type: 'bar', barMaxWidth: 24, itemStyle: { color: '#dc2626', borderRadius: [3, 3, 0, 0] }, data: bs.map(b => b.arrears) }
+    ]
+  }, 'building');
+
+  // 3. 设备分类与状态
+  const ec = o.equipments.byCategory;
+  dashChart('dbEq', {
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    legend: dashLegend(['正常', '维修中', '停用']), grid: dashGrid(),
+    xAxis: Object.assign({ type: 'category', data: ec.map(x => x.label) }, DASH_AXIS, {
+      axisLabel: { color: '#94a3b8', fontSize: 10, interval: 0, formatter: v => v === '厨房设备' ? '厨房' : v }
+    }),
+    yAxis: Object.assign(dashValueAxis(), { minInterval: 1 }),
+    series: [
+      { name: '正常', type: 'bar', stack: 'eq', barMaxWidth: 30, itemStyle: { color: '#059669' }, data: ec.map(x => x.normal) },
+      { name: '维修中', type: 'bar', stack: 'eq', itemStyle: { color: '#dc2626' }, data: ec.map(x => x.repair) },
+      { name: '停用', type: 'bar', stack: 'eq', itemStyle: { color: '#cbd5e1', borderRadius: [3, 3, 0, 0] }, data: ec.map(x => x.stopped) }
+    ]
+  }, 'eqCat');
+
+  // 4. 合同付款执行
+  const cl = o.contracts.rows.slice().sort((a, b) => (Number(b.amount) || 0) - (Number(a.amount) || 0)).slice(0, 6).reverse();
+  dashChart('dbPay', {
+    tooltip: dashMoneyTip(), legend: dashLegend(['已付', '未付']),
+    grid: { left: 4, right: 16, top: 32, bottom: 0, containLabel: true },
+    xAxis: dashValueAxis(),
+    yAxis: Object.assign({ type: 'category', data: cl.map(c => c.name || '') }, DASH_AXIS, {
+      axisLabel: { color: '#94a3b8', fontSize: 11, formatter: v => String(v).length > 9 ? String(v).slice(0, 9) + '…' : v }
+    }),
+    series: [
+      { name: '已付', type: 'bar', stack: 'pay', barMaxWidth: 22, itemStyle: { color: '#7c3aed' }, data: cl.map(c => c.paid) },
+      { name: '未付', type: 'bar', stack: 'pay', itemStyle: { color: '#e2e8f0', borderRadius: [0, 4, 4, 0] }, data: cl.map(c => c.unpaid) }
+    ]
+  }, 'contract');
+
+  // 5. 账单收缴趋势
+  dashChart('dbBill', {
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } }, legend: dashLegend(['应收', '实收', '收缴率']),
+    grid: dashGrid(), xAxis: dashMonthAxis(months),
+    yAxis: [
+      dashValueAxis(),
+      { type: 'value', min: 0, max: 100, splitLine: { show: false }, axisLabel: { color: '#94a3b8', fontSize: 11, formatter: '{value}%' } }
+    ],
+    series: [
+      { name: '应收', type: 'bar', barMaxWidth: 18, itemStyle: { color: '#cbd5e1', borderRadius: [3, 3, 0, 0] }, data: o.billing.byMonth.map(x => x.due) },
+      { name: '实收', type: 'bar', barMaxWidth: 18, itemStyle: { color: '#2563eb', borderRadius: [3, 3, 0, 0] }, data: o.billing.byMonth.map(x => x.paid) },
+      { name: '收缴率', type: 'line', yAxisIndex: 1, smooth: true, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2, color: '#059669' }, itemStyle: { color: '#059669' }, data: o.billing.byMonth.map(x => x.rate) }
+    ]
+  }, 'month');
+
+  // 6. 水电用量与费用
+  dashChart('dbUtil', {
+    tooltip: { trigger: 'axis' }, legend: dashLegend(['用水量(吨)', '用电量(度)', '水电费用']),
+    grid: dashGrid(), xAxis: dashMonthAxis(months),
+    yAxis: [
+      { type: 'value', splitLine: { lineStyle: { color: '#f1f5f9' } }, axisLabel: { color: '#94a3b8', fontSize: 11 } },
+      dashValueAxis()
+    ],
+    series: [
+      { name: '用水量(吨)', type: 'bar', barMaxWidth: 16, itemStyle: { color: '#38bdf8', borderRadius: [3, 3, 0, 0] }, data: o.utility.map(x => x.water) },
+      { name: '用电量(度)', type: 'bar', barMaxWidth: 16, itemStyle: { color: '#a78bfa', borderRadius: [3, 3, 0, 0] }, data: o.utility.map(x => x.elec) },
+      { name: '水电费用', type: 'line', yAxisIndex: 1, smooth: true, symbol: 'circle', symbolSize: 5, lineStyle: { width: 2, color: '#dc2626' }, itemStyle: { color: '#dc2626' }, data: o.utility.map(x => round2(x.waterFee + x.elecFee)) }
+    ]
+  }, 'utility');
+
+  // 7. 付款节点到期分布
+  dashChart('dbDue', {
+    tooltip: dashMoneyTip(), legend: dashLegend(['计划应付', '实际付款', '逾期未付']),
+    grid: dashGrid(), xAxis: dashMonthAxis(months), yAxis: dashValueAxis(),
+    series: [
+      { name: '计划应付', type: 'bar', barMaxWidth: 18, itemStyle: { color: '#cbd5e1', borderRadius: [3, 3, 0, 0] }, data: o.dueTrend.map(x => x.due) },
+      { name: '实际付款', type: 'bar', barMaxWidth: 18, itemStyle: { color: '#7c3aed', borderRadius: [3, 3, 0, 0] }, data: o.dueTrend.map(x => x.paid) },
+      { name: '逾期未付', type: 'bar', barMaxWidth: 18, itemStyle: { color: '#dc2626', borderRadius: [3, 3, 0, 0] }, data: o.dueTrend.map(x => x.overdue) }
+    ]
+  }, 'month');
+
+  // 8. 合同结构（按状态）
+  const cs = o.contracts.byStatus;
+  dashChart('dbContract', {
+    tooltip: { trigger: 'item', formatter: p => `${p.name}<br/>${p.value} 份（${p.percent}%）` },
+    legend: { bottom: 0, icon: 'circle', itemWidth: 7, itemHeight: 7, textStyle: { fontSize: 11, color: '#64748b' } },
+    color: ['#94a3b8', '#2563eb', '#f59e0b', '#059669', '#7c3aed'],
+    series: [{
+      type: 'pie', radius: ['46%', '68%'], center: ['50%', '43%'],
+      itemStyle: { borderColor: '#fff', borderWidth: 3 }, labelLine: { show: false },
+      label: { show: true, position: 'center', formatter: () => `{a|${o.contracts.total}}\n{b|合同总数}`, rich: { a: { fontSize: 20, fontWeight: 700, color: '#0f172a' }, b: { fontSize: 10, color: '#94a3b8', padding: [3, 0, 0, 0] } } },
+      data: cs.filter(x => x.count > 0).map(x => ({ name: x.label, value: x.count }))
+    }]
+  }, 'contract');
+}
+
+/** 兼容旧调用点：两个旧入口都指向合并后的图表挂载 */
+function mountCharts() { return mountCockpitCharts(); }
+function mountDashboardCharts() { return mountCockpitCharts(); }
+
+/* 1.25.0：窗口缩放 / 手机横竖屏切换 → 重算图表并校正抽屉状态 */
+function onViewportChange() { resizeCharts(); syncNavOnResize(); }
+window.addEventListener('resize', onViewportChange);
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('orientationchange', onViewportChange);
+}
+
+/* ============================================================
+   商铺
+   ============================================================ */
+function shopMonthly(s) {
+  const rt = Number(s && s.rent_total);
+  if (Number.isFinite(rt) && rt > 0) return rt; // 手动输入租金总金额优先
+  return (Number(s && s.area) || 0) * (Number(s && s.rent_price) || 0);
+}
+
+/** 租金单价：手动填了月租金总金额时按「总额 ÷ 面积」反算，保证单价与总额一致（1.10.1 修复） */
+function shopUnitPrice(s) {
+  const rt = Number(s && s.rent_total);
+  const area = Number(s && s.area) || 0;
+  if (Number.isFinite(rt) && rt > 0 && area > 0) return round2(rt / area);
+  return Number(s && s.rent_price) || 0;
+}
+
+/** 商铺表单：面积 / 租金单价 / 月租金总金额 三字段联动 */
+function syncShopRentFields(form) {
+  const areaEl = form && form.querySelector('[data-k="area"]');
+  const priceEl = form && form.querySelector('[data-k="rent_price"]');
+  const totalEl = form && form.querySelector('[data-k="rent_total"]');
+  const hintEl = form && form.querySelector('#rentCalcHint');
+  if (!areaEl || !priceEl || !totalEl) return;
+  const area = () => Number(areaEl.value) || 0;
+  const show = () => {
+    if (!hintEl) return;
+    const t = Number(totalEl.value);
+    const p = shopUnitPrice({ area: area(), rent_total: t, rent_price: priceEl.value });
+    hintEl.textContent = t > 0
+      ? `已按手动总额反算单价 ${p} 元/㎡/月（${t} ÷ ${area()}㎡）`
+      : `月租金按 ${p} 元/㎡ × ${area()}㎡ = ${round2(p * area())} 元 自动计算`;
+  };
+  // 手动输入总额（或改面积）→ 自动反算租金单价
+  const fromTotal = () => {
+    const t = Number(totalEl.value);
+    if (Number.isFinite(t) && t > 0 && area() > 0) priceEl.value = String(round2(t / area()));
+    show();
+  };
+  totalEl.addEventListener('input', fromTotal);
+  areaEl.addEventListener('input', fromTotal);
+  priceEl.addEventListener('input', () => {
+    // 改单价时同步总额（已有手动总额才同步；留空保持「单价 × 面积」自动模式）
+    if (String(totalEl.value).trim() !== '' && area() > 0) {
+      totalEl.value = String(round2(area() * (Number(priceEl.value) || 0)));
+    }
+    show();
+  });
+  fromTotal(); // 打开表单即按已有手动总额校正单价，修复旧数据单价不同步
+}
+
+/* ============================================================
+   1.26.0 楼栋管理（商铺管理模块内的子页）
+   楼栋台账的 name 即商铺 building 的关联键；所有汇总均由现有业务数据实时聚合
+   ============================================================ */
+const buildingRows = () => ((S.data && S.data.buildings) || []).slice();
+
+/** 台账楼栋 + 商铺里实际用到的楼栋（并集），供下拉与筛选使用 */
+function buildingNames() {
+  const names = buildingRows().map(b => String(b.name || '').trim()).filter(Boolean);
+  ((S.data && S.data.shops) || []).forEach(s => {
+    const n = String(s.building || '').trim();
+    if (n && names.indexOf(n) < 0) names.push(n);
+  });
+  return names.sort((a, b) => a.localeCompare(b, 'zh-CN'));
+}
+/** 商铺表单的下拉选项；编辑历史数据时把当前值也带进来，避免旧楼栋被清空 */
+function buildingOptions(current) {
+  const names = buildingNames();
+  const cur = String(current || '').trim();
+  if (cur && names.indexOf(cur) < 0) names.push(cur);
+  return names.sort((a, b) => a.localeCompare(b, 'zh-CN')).map(n => ({ k: n, n }));
+}
+/** 商铺里出现、但台账还没建档的楼栋名 */
+function unregisteredBuildings() {
+  const reg = new Set(buildingRows().map(b => String(b.name || '').trim()).filter(Boolean));
+  return Array.from(new Set(((S.data && S.data.shops) || [])
+    .map(s => String(s.building || '').trim()).filter(Boolean)))
+    .filter(n => !reg.has(n)).sort((a, b) => a.localeCompare(b, 'zh-CN'));
+}
+/** 单栋楼的实时经营汇总 */
+function buildingStats(name) {
+  const key = String(name || '').trim();
+  const list = ((S.data && S.data.shops) || []).filter(s => String(s.building || '').trim() === key);
+  const rented = list.filter(s => s.status === 'rented').length;
+  return {
+    list, total: list.length, rented,
+    vacant: list.filter(s => s.status === 'vacant').length,
+    maintenance: list.filter(s => s.status === 'maintenance').length,
+    decorating: list.filter(s => shopWorkStatus(s, 'decoration') === 'doing').length,
+    repairing: list.filter(s => shopWorkStatus(s, 'repair') === 'doing').length,
+    area: list.reduce((n, s) => n + (Number(s.area) || 0), 0),
+    rent: list.reduce((n, s) => n + shopMonthly(s), 0),
+    unpaid: list.reduce((n, s) => n + shopUnpaid(s.id), 0),
+    rate: list.length ? Math.round(rented / list.length * 100) : 0
+  };
+}
+
+function shopTabBar() {
+  const shops = (S.data && S.data.shops) || [];
+  return `<div class="dash-tabs shop-tabs" id="shopTabs" data-shop-tabs="1">
+    <span class="dt-label">商铺管理</span>
+    ${SHOP_TABS.map(x => `<button class="dt ${S.shopTab === x.k ? 'active' : ''}" data-act="shopTab" data-k="${x.k}">${x.n}<b>${x.k === 'shops' ? shops.length : buildingRows().length}</b></button>`).join('')}
+    <span class="dt-tip">${S.shopTab === 'buildings'
+      ? '楼栋是商铺的归属主数据；改名自动同步商铺，删除前需先迁走商铺'
+      : '按楼栋查看与筛选商铺，楼栋台账在「楼栋管理」中维护'}</span>
+  </div>`;
+}
+
+function buildingChipsHtml() {
+  const shops = (S.data && S.data.shops) || [];
+  const count = (n) => shops.filter(s => String(s.building || '').trim() === n).length;
+  return `<div class="toolbar" style="margin-top:-6px" data-building-filter="1">
+    <span style="font-size:11.5px;color:var(--faint)">楼栋</span>
+    <div class="chips">
+      <button class="chip ${S.shopBuilding === 'all' ? 'active' : ''}" data-act="shopBuilding" data-k="all">全部<b>${shops.length}</b></button>
+      ${buildingNames().map(n => `<button class="chip ${S.shopBuilding === n ? 'active' : ''}" data-act="shopBuilding" data-k="${esc(n)}">${esc(n)}<b>${count(n)}</b></button>`).join('')}
+    </div>
+    <span class="spacer"></span>
+    <span style="font-size:11px;color:var(--faint)">筛选结果会同步到导出与表格预览</span>
+  </div>`;
+}
+
+function viewBuildings() {
+  const shops = (S.data && S.data.shops) || [];
+  const rows = buildingRows().sort((a, b) =>
+    String(a.code || a.name || '').localeCompare(String(b.code || b.name || ''), 'zh-CN'));
+  const missing = unregisteredBuildings();
+  const rented = shops.filter(s => s.status === 'rented').length;
+  const area = shops.reduce((n, s) => n + (Number(s.area) || 0), 0);
+  const rent = shops.reduce((n, s) => n + shopMonthly(s), 0);
+  const rate = shops.length ? Math.round(rented / shops.length * 100) : 0;
+
+  const summary = `<div class="stats" data-building-summary="1">
+    <div class="stat"><div class="lbl">楼栋总数</div><div class="val">${rows.length}<small>栋</small></div>
+      <div class="sub">启用 ${rows.filter(b => b.status !== 'inactive').length} · 停用 ${rows.filter(b => b.status === 'inactive').length}</div></div>
+    <div class="stat green"><div class="lbl">商铺总数</div><div class="val">${shops.length}<small>间</small></div>
+      <div class="sub">在租 ${rented} · 空置 ${shops.filter(s => s.status === 'vacant').length}</div></div>
+    <div class="stat violet"><div class="lbl">总建筑面积</div><div class="val">${num(area)}<small>㎡</small></div>
+      <div class="sub">台账登记 ${num(rows.reduce((n, b) => n + (Number(b.area) || 0), 0))} ㎡</div></div>
+    <div class="stat amber"><div class="lbl">整体出租率</div><div class="val">${rate}<small>%</small></div>
+      <div class="sub">月租金合计 ${money(rent)}</div></div>
+  </div>`;
+
+  const hint = missing.length && canEdit()
+    ? `<div class="bld-hint" data-bld-missing="1"><span>发现 <b>${missing.length}</b> 个楼栋已在商铺中使用、但尚未建档：${missing.map(n => esc(n)).join('、')}</span>
+        <span class="spacer"></span><button class="btn btn-sm btn-primary" data-act="quickCreateBuildings">一键补建楼栋</button></div>`
+    : '';
+
+  const toolbar = `<div class="toolbar">
+    <div class="chips"><span class="chip active">楼栋台账<b>${rows.length}</b></span></div>
+    ${canEdit() ? `<button class="btn btn-primary" data-act="newBuilding">＋ 新增楼栋</button>` : ''}
+    <span class="spacer"></span>
+    <span style="font-size:11px;color:var(--faint)">点「查看商铺」按楼栋筛选列表 · 楼栋可挂图纸与资料附件</span>
+  </div>`;
+
+  if (!rows.length) {
+    return shopTabBar() + summary + hint + toolbar
+      + `<div class="card"><div class="card-body"><div class="empty">还没有楼栋台账，点「＋ 新增楼栋」开始建档${missing.length ? '，或用「一键补建」按现有商铺自动生成' : ''}</div></div></div>`;
+  }
+
+  const cards = rows.map(b => {
+    const st = buildingStats(b.name);
+    const status = BUILDING_STATUS[b.status] || BUILDING_STATUS.active;
+    return `<div class="ecard${b.status === 'inactive' ? '' : ' tone-brand'}" data-building-card="${b.id}">
+      <div class="ec-head">
+        <div style="min-width:0"><div class="ec-title">${esc(b.name)}</div>
+          <div class="ec-sub">${esc(b.code || '未编号')}${b.floors ? ' · ' + esc(b.floors) : ''}</div></div>
+        <span class="pill ${status[1]}">${status[0]}</span>
+      </div>
+      <div class="ec-rows">
+        <div class="ec-row"><span class="k">商铺 / 在租</span><span class="v">${st.total} 间 · ${st.rented} 在租</span></div>
+        <div class="ec-row"><span class="k">空置 / 维修</span><span class="v">${st.vacant} / ${st.maintenance}</span></div>
+        <div class="ec-row"><span class="k">装修 / 维修中</span><span class="v">${st.decorating} / ${st.repairing}</span></div>
+        <div class="ec-row"><span class="k">商铺总面积</span><span class="v">${num(st.area)} ㎡</span></div>
+        <div class="ec-row"><span class="k">月租金合计</span><span class="v money">${money(st.rent)}</span></div>
+        <div class="ec-row"><span class="k">欠费合计</span><span class="v"${st.unpaid > 0 ? ' style="color:var(--red)"' : ''}>${money(st.unpaid)}</span></div>
+      </div>
+      <div class="bld-bar${st.rate < 50 ? ' low' : ''}"><span style="width:${st.rate}%"></span></div>
+      <div class="bld-meta"><span>出租率 <b>${st.rate}%</b></span>
+        ${b.manager ? `<span>· 负责人 <b>${esc(b.manager)}</b></span>` : ''}
+        ${b.built_year ? `<span>· ${esc(b.built_year)} 年建成</span>` : ''}</div>
+      <div class="sc-foot">
+        <button class="btn-link" data-act="buildingDetail" data-id="${b.id}">详情</button>
+        <button class="btn-link" data-act="buildingShops" data-k="${esc(b.name)}">查看商铺</button>
+        ${canEdit() ? `<button class="btn-link" data-act="editBuilding" data-id="${b.id}">编辑</button>
+          <button class="btn-link danger" data-act="delBuilding" data-id="${b.id}" style="margin-left:auto">删除</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  return shopTabBar() + summary + hint + toolbar + `<div class="bld-grid" data-building-grid="1">${cards}</div>`;
+}
+
+function buildingForm(id) {
+  const b = id ? buildingRows().find(x => x.id === Number(id)) : { status: 'active' };
+  if (id && !b) { toast('楼栋不存在', 'err'); return; }
+  openForm({
+    title: id ? '编辑楼栋' : '新增楼栋',
+    sub: id ? '改名后所属商铺的楼栋会自动同步' : '楼栋名称将作为商铺「楼栋」下拉选项',
+    values: b,
+    fields: [
+      { k: 'name', label: '楼栋名称', required: true, placeholder: '如：A栋',
+        hint: '名称须唯一；改名会自动同步该楼栋下所有商铺' },
+      { k: 'code', label: '楼栋编号', placeholder: '如：BLD-A' },
+      { k: 'floors', label: '楼层 / 层数', placeholder: '如：1F / 2F' },
+      { k: 'area', label: '建筑面积（㎡）', type: 'number', step: '0.01' },
+      { k: 'manager', label: '楼栋负责人' },
+      { k: 'phone', label: '联系电话' },
+      { k: 'built_year', label: '建成年份', placeholder: '如：2018' },
+      { k: 'status', label: '状态', type: 'select',
+        options: Object.keys(BUILDING_STATUS).map(k => ({ k, n: BUILDING_STATUS[k][0] })) },
+      { k: 'remark', label: '备注', type: 'textarea', full: true }
+    ],
+    onSubmit: async (v) => {
+      if (id) await api('/buildings/' + id, { method: 'PUT', body: v });
+      else await api('/buildings', { method: 'POST', body: v });
+      toast(id ? '楼栋已更新' : '楼栋已创建');
+      await refresh(() => { if (id) openBuildingDetail(id); });
+    },
+    attach: id ? { entity: 'buildings', id: Number(id) } : null
+  });
+}
+
+function openBuildingDetail(id) {
+  const b = buildingRows().find(x => x.id === Number(id));
+  if (!b) return;
+  const st = buildingStats(b.name);
+  const status = BUILDING_STATUS[b.status] || BUILDING_STATUS.active;
+  const rowsHtml = st.list.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>商铺</th><th>楼层</th><th class="num">面积</th><th>状态</th><th class="num">月租金</th><th>租户</th></tr></thead>
+    <tbody>${st.list.map(s => `<tr>
+      <td><div class="t-main" style="cursor:pointer" data-act="buildingShop" data-id="${s.id}">${esc(s.name)}</div><div class="t-sub">${esc(s.code || '—')}</div></td>
+      <td>${esc(s.floor || '—')}</td><td class="num">${num(s.area)} ㎡</td>
+      <td>${pill(SHOP_STATUS, s.status)}</td><td class="num">${money(shopMonthly(s))}</td>
+      <td>${esc(s.tenant || '—')}</td></tr>`).join('')}</tbody></table></div>`
+    : `<div class="empty">该楼栋下还没有商铺</div>`;
+  const body = `<div class="sect-title">楼栋信息<span class="line"></span></div>
+    <div class="kv">
+      <div><div class="k">楼栋名称</div><div class="v">${esc(b.name)}</div></div>
+      <div><div class="k">楼栋编号</div><div class="v">${esc(b.code || '—')}</div></div>
+      <div><div class="k">楼层 / 层数</div><div class="v">${esc(b.floors || '—')}</div></div>
+      <div><div class="k">建筑面积</div><div class="v">${b.area != null ? num(b.area) + ' ㎡' : '—'}</div></div>
+      <div><div class="k">负责人</div><div class="v">${esc(b.manager || '—')}</div></div>
+      <div><div class="k">联系电话</div><div class="v">${esc(b.phone || '—')}</div></div>
+      <div><div class="k">建成年份</div><div class="v">${esc(b.built_year || '—')}</div></div>
+      <div><div class="k">状态</div><div class="v"><span class="pill ${status[1]}">${status[0]}</span></div></div>
+    </div>
+    ${b.remark ? `<div style="margin-top:12px;font-size:12.5px;color:var(--muted)">备注：${esc(b.remark)}</div>` : ''}
+    <div class="mini-stats">
+      <div class="mini"><div class="k">商铺 / 在租</div><div class="v">${st.total} / ${st.rented}</div></div>
+      <div class="mini"><div class="k">出租率</div><div class="v">${st.rate}%</div></div>
+      <div class="mini"><div class="k">月租金合计</div><div class="v">${money(st.rent)}</div></div>
+      <div class="mini"><div class="k">累计欠费</div><div class="v ${st.unpaid > 0 ? 'red' : ''}">${money(st.unpaid)}</div></div>
+    </div>
+    <div class="sect-title">所属商铺（${st.total} 间）<span class="line"></span></div>
+    ${rowsHtml}
+    ${attachPanelHtml('buildings', Number(id), { empty: '暂无楼栋图纸 / 资料附件', readonly: !canEdit() })}`;
+  openModal({
+    title: b.name, sub: `楼栋档案 · ${b.code || ''}`, body, size: 'lg',
+    footer: `<button class="btn" data-act="closeModal">关闭</button>
+             <button class="btn" data-act="buildingShops" data-k="${esc(b.name)}">查看商铺列表</button>
+             ${canEdit() ? `<button class="btn btn-primary" data-act="editBuilding" data-id="${b.id}">编辑楼栋</button>` : ''}`
+  });
+}
+
+/** 把商铺里用到、台账里没有的楼栋一次性补建（老数据升级 / 手填楼栋后使用） */
+async function quickCreateBuildings() {
+  if (!canEdit()) return;
+  const missing = unregisteredBuildings();
+  if (!missing.length) { toast('所有楼栋均已建档'); return; }
+  for (const name of missing) {
+    await api('/buildings', {
+      method: 'POST',
+      body: { name, status: 'active', remark: '按现有商铺一键补建' }
+    });
+  }
+  toast(`已补建 ${missing.length} 栋楼`);
+  await refresh();
+}
+
+function viewShops() {
+  // 楼栋被删除 / 改名后自动复位筛选，避免列表一直空白
+  if (S.shopBuilding !== 'all' && buildingNames().indexOf(S.shopBuilding) < 0) S.shopBuilding = 'all';
+  if (S.shopTab === 'buildings') return viewBuildings();
+  const arrearsList = S.data.shops.filter(s => shopUnpaid(s.id) > 0);
+  const arrearsTotal = arrearsList.reduce((n, s) => n + shopUnpaid(s.id), 0);
+  const shops = S.data.shops.filter(s => {
+    const hit = matchQuery(S.shopQuery, [s.name, s.code, s.tenant, s.tenant_phone, s.building, s.floor]);
+    const st = S.shopStatus === 'all' ? true
+      : S.shopStatus === 'arrears' ? shopUnpaid(s.id) > 0
+      : S.shopStatus === 'decorating' ? shopWorkStatus(s, 'decoration') === 'doing'
+      : S.shopStatus === 'maintenance' ? shopRepairScope(s)
+      : s.status === S.shopStatus;
+    // 1.26.0：楼栋筛选与搜索 / 状态筛选叠加
+    const bHit = S.shopBuilding === 'all' || String(s.building || '').trim() === S.shopBuilding;
+    return hit && st && bHit;
+  });
+  // 1.19.0：「维修」并入维修工程进度，统计与筛选同源，避免与旧「维修中」重复计数
+  const count = (k) => k === 'maintenance'
+    ? S.data.shops.filter(shopRepairScope).length
+    : S.data.shops.filter(s => s.status === k).length;
+  const seg = segHtml('shops');
+  const chips = [
+    ['all', '全部', S.data.shops.length],
+    ['rented', '在租', count('rented')],
+    ['vacant', '空置', count('vacant')],
+    ['maintenance', '维修', count('maintenance')],
+    ['decorating', '装修中', S.data.shops.filter(s => shopWorkStatus(s, 'decoration') === 'doing').length],
+    ['arrears', '欠费', moneyShort(arrearsTotal)]
+  ].map(([k, n, c]) => {
+    const warn = k === 'arrears' && arrearsTotal > 0 ? ' warn' : '';
+    const tip = k === 'arrears' ? ` title="共 ${arrearsList.length} 间商铺欠费，合计 ${money(arrearsTotal)}"` : '';
+    return `<button class="chip${warn} ${S.shopStatus === k ? 'active' : ''}" data-act="shopStatus" data-k="${k}"${tip}>${n}<b>${c}</b></button>`;
+  }).join('');
+
+  // 1.26.0：子页切换 + 楼栋筛选 chips 拼进 toolbar，列表 / 卡片 / 空态都会带上
+  const toolbar = shopTabBar() + `
+  <div class="toolbar">
+    <div class="chips">${chips}</div>
+    ${searchBox('shopSearch', '搜索商铺 / 租户', S.shopQuery)}
+    ${seg}
+  </div>` + buildingChipsHtml();
+
+  if (!shops.length) {
+    const emptyMsg = S.shopStatus === 'arrears' ? '当前没有欠费商铺' : '没有匹配的商铺';
+    return toolbar + `<div class="card"><div class="card-body" style="padding:0"><div class="empty">${emptyMsg}</div></div></div>`;
+  }
+
+  if (modeOf('shops') === 'card') return toolbar + '<div class="shop-grid">' + shops.map(s => {
+    const unpaid = shopUnpaid(s.id);
+    const loc = [s.building, s.floor].filter(Boolean).join(' · ');
+    return `<div class="shop-card st-${esc(s.status)}" data-act="shop" data-id="${s.id}">
+      <div class="sc-top">
+        <div style="min-width:0">
+          <div class="sc-name">${esc(s.name)}</div>
+          <div class="sc-code">${esc(s.code || '—')}${loc ? ' · ' + esc(loc) : ''}</div>
+        </div>
+        ${pill(SHOP_STATUS, s.status)}
+      </div>
+      <div class="sc-metrics">
+        <div><div class="k">面积</div><div class="v">${num(s.area)}<small>㎡</small></div></div>
+        <div><div class="k">单价</div><div class="v">${num(shopUnitPrice(s))}<small>元/㎡</small></div></div>
+        <div><div class="k">月租金</div><div class="v brand">${money(shopMonthly(s))}</div></div>
+      </div>
+      <div class="sc-tenant">
+        ${s.tenant
+          ? `<span class="nm">${esc(s.tenant)}</span>${s.tenant_phone ? `<span class="ph">${esc(s.tenant_phone)}</span>` : ''}`
+          : `<span style="color:var(--faint)">暂无租户</span>`}
+        ${unpaid > 0 ? `<span class="sc-due">欠费 ${moneyShort(unpaid)}</span>` : ''}
+      </div>
+      <div class="sc-work">
+        <div><span>装修</span>${shopWorkPill(s, 'decoration')}<b>${shopWorkProgress(s, 'decoration')}%</b></div>
+        <div><span>维修</span>${shopWorkPill(s, 'repair')}<b>${shopWorkProgress(s, 'repair')}%</b></div>
+      </div>
+      <div class="sc-foot">
+        <button class="btn-link" data-act="shop" data-id="${s.id}">详情</button>
+        <button class="btn-link" data-act="addReading" data-id="${s.id}">抄表</button>
+        <button class="btn-link" data-act="genBill" data-id="${s.id}">账单</button>
+        <button class="btn-link" data-act="editShop" data-id="${s.id}">编辑</button>
+        <button class="btn-link danger" data-act="delShop" data-id="${s.id}" style="margin-left:auto">删除</button>
+      </div>
+    </div>`;
+  }).join('') + '</div>';
+
+  return toolbar + `<div class="card"><div class="card-body" style="padding:0">
+    <div class="table-wrap" style="border:none">
+      <table>
+        <thead><tr>
+          <th>商铺</th><th>位置</th><th class="num">面积</th><th class="num">租金单价</th>
+          <th class="num">月租金</th><th>租户</th><th>状态</th><th>装修 / 维修</th><th style="width:130px">操作</th>
+        </tr></thead>
+        <tbody>
+        ${shops.map(s => `
+          <tr>
+            <td><div class="t-main" style="cursor:pointer" data-act="shop" data-id="${s.id}">${esc(s.name)}</div><div class="t-sub">${esc(s.code || '—')}</div></td>
+            <td>${esc([s.building, s.floor].filter(Boolean).join(' · ') || '—')}</td>
+            <td class="num">${num(s.area)} ㎡</td>
+            <td class="num">${num(shopUnitPrice(s))} 元/㎡</td>
+            <td class="num"><b>${money(shopMonthly(s))}</b></td>
+            <td>${s.tenant ? esc(s.tenant) + `<div class="t-sub">${esc(s.tenant_phone || '')}</div>` : '<span style="color:var(--faint)">—</span>'}</td>
+            <td>${pill(SHOP_STATUS, s.status)}</td>
+            <td>
+              <div style="display:flex;align-items:center;gap:5px;font-size:11px;white-space:nowrap">
+                ${shopWorkPill(s, 'decoration')}<b style="color:var(--muted)">${shopWorkProgress(s, 'decoration')}%</b>
+                <span style="color:var(--line)">/</span>
+                ${shopWorkPill(s, 'repair')}<b style="color:var(--muted)">${shopWorkProgress(s, 'repair')}%</b>
+              </div>
+            </td>
+            <td>
+              <button class="btn-link" data-act="shop" data-id="${s.id}">详情</button>
+              <button class="btn-link" data-act="editShop" data-id="${s.id}">编辑</button>
+              <button class="btn-link danger" data-act="delShop" data-id="${s.id}">删除</button>
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+  </div></div>`;
+}
+
+/* 1.18.0：商铺装修 / 维修状态卡与逐条进度时间线（详情与打印共用） */
+function shopWorkCard(d, type, editable) {
+  const s = d.s;
+  const logs = shopWorkLogs(s.id, type);
+  const name = SHOP_WORK_TYPES[type];
+  const status = shopWorkStatus(s, type), pct = shopWorkProgress(s, type);
+  const last = logs[0];
+  return `<div class="work-card">
+    <div class="wh"><span>${type === 'repair' ? '维修工程' : name}状态</span>${shopWorkPill(s, type)}<span class="spacer"></span>
+      ${editable ? `<button class="btn-link" data-act="editShopWork" data-id="${s.id}" data-type="${type}">编辑状态</button>` : ''}</div>
+    ${workBar(pct)}
+    <div class="wmeta">共 ${logs.length} 条进度记录${last ? ` · 最近 ${esc(last.log_date || '')} ${esc(last.title || '')}` : ' · 暂无进度'}${status === 'done' ? ' · 已完工' : ''}</div>
+  </div>`;
+}
+
+function shopWorkTimeline(d, type, editable) {
+  const logs = shopWorkLogs(d.s.id, type);
+  const name = SHOP_WORK_TYPES[type];
+  return `<div class="sect-title">${name}进度记录<span class="line"></span>
+      ${editable ? `<button class="btn btn-sm" data-act="addShopWork" data-id="${d.s.id}" data-type="${type}">＋ 添加${name}进度</button>` : ''}</div>
+    ${logs.length ? `<ul class="timeline">${logs.map(l => `
+      <li>
+        <div class="th"><b>${esc(l.title || name + '进度')}</b>
+          ${shopWorkPill({ decoration_status: type === 'repair' ? '' : l.status, repair_status: type === 'repair' ? l.status : '' }, type)}
+          <span>${esc(l.log_date || '')}</span></div>
+        <p>${esc(l.content || '（无描述）')} · 进度 ${clamp(Number(l.progress) || 0, 0, 100)}%</p>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          ${l.operator ? `<span class="pp">${esc(l.operator)}</span>` : ''}
+          <span style="margin-left:auto"></span>
+          ${editable ? `<button class="btn-link" data-act="editShopWorkLog" data-id="${l.id}">编辑</button>
+            <button class="btn-link danger" data-act="delShopWorkLog" data-id="${l.id}">删除</button>` : ''}
+        </div>
+      </li>`).join('')}</ul>` : `<div class="empty">暂无${name}进度记录</div>`}`;
+}
+
+/** 仅用于屏幕详情弹窗；1.21.0 起商铺 A4 打印稿不渲染本区块 */
+function shopWorksHtml(d, editable) {
+  return `
+    <div class="sect-title">装修 / 维修工程状态与进度<span class="line"></span></div>
+    <div class="work-panel">${shopWorkCard(d, 'decoration', editable)}${shopWorkCard(d, 'repair', editable)}</div>
+    ${shopWorkTimeline(d, 'decoration', editable)}
+    ${shopWorkTimeline(d, 'repair', editable)}`;
+}
+
+function shopDetailData(id) {
+  const s = S.data.shops.find(x => x.id === Number(id));
+  if (!s) return null;
+  const reads = S.data.readings.filter(r => r.shop_id === s.id)
+    .sort((a, b) => String(b.period).localeCompare(String(a.period)));
+  const bills = S.data.bills.filter(b => b.shop_id === s.id)
+    .sort((a, b) => String(b.period).localeCompare(String(a.period)));
+  const unpaid = bills.filter(b => b.status !== 'paid').reduce((n, b) => n + (Number(b.total) || 0), 0);
+  return {
+    s, reads, bills, unpaid,
+    last: reads[0],
+    area: Number(s.area) || 0,
+    rent: shopMonthly(s)
+  };
+}
+
+/* 商铺档案主体：详情弹窗与打印共用同一份排版 */
+function shopDetailInner(d, opt) {
+  opt = opt || {};
+  // 打印档案只保留数据列；详情弹窗额外提供逐条编辑 / 删除操作
+  const editable = !opt.print;
+  const { s, reads, bills, unpaid, last, area, rent } = d;
+  const atts = attsOf('shops', s.id);
+  const attSection = opt.print
+    ? (atts.length ? `
+    <div class="sect-title">现场图片 / 附件<span class="line"></span></div>
+    ${thumbsHtml('shops', s.id, 6)}` : '')
+    : `
+    <div class="sect-title">图片 / 附件<span class="line"></span></div>
+    ${attGalleryHtml('shops', s.id, 3, '暂无商铺照片 / 附件')}
+    ${attachPanelHtml('shops', s.id, { empty: '暂无商铺照片 / 附件，点下方按钮上传' })}`;
+  return `
+    <div class="kv">
+      <div><div class="k">商铺编号</div><div class="v">${esc(s.code || '—')}</div></div>
+      <div><div class="k">位置</div><div class="v">${esc([s.building, s.floor].filter(Boolean).join(' · ') || '—')}</div></div>
+      <div><div class="k">建筑面积</div><div class="v">${num(area)} ㎡</div></div>
+      <div><div class="k">租金单价</div><div class="v">${num(shopUnitPrice(s))} 元/㎡/月</div></div>
+      <div><div class="k">合同月租金</div><div class="v">${money(rent)}</div></div>
+      <div><div class="k">状态</div><div class="v">${pill(SHOP_STATUS, s.status)}</div></div>
+      <div><div class="k">租户</div><div class="v">${esc(s.tenant || '—')} ${s.tenant_phone ? '· ' + esc(s.tenant_phone) : ''}</div></div>
+      <div><div class="k">租期</div><div class="v">${esc(s.lease_start || '—')} 至 ${esc(s.lease_end || '—')}</div></div>
+      <div><div class="k">押金</div><div class="v">${money(s.deposit)}</div></div>
+      <div><div class="k">水电单价</div><div class="v">水 ${num(s.water_price)} 元/吨 · 电 ${num(s.elec_price)} 元/度</div></div>
+    </div>
+    ${s.remark ? `<div style="margin-top:12px;font-size:12.5px;color:var(--muted)">备注：${esc(s.remark)}</div>` : ''}
+
+    <div class="mini-stats">
+      <div class="mini"><div class="k">本期水费（最近抄表）</div><div class="v">${last ? money(last.water_fee) : '—'}</div></div>
+      <div class="mini"><div class="k">本期电费（最近抄表）</div><div class="v">${last ? money(last.elec_fee) : '—'}</div></div>
+      <div class="mini"><div class="k">累计未收账单</div><div class="v ${unpaid > 0 ? 'red' : ''}">${money(unpaid)}</div></div>
+      <div class="mini"><div class="k">抄表 / 账单</div><div class="v">${reads.length} / ${bills.length}</div></div>
+    </div>
+
+    ${opt.print ? '' : shopWorksHtml(d, editable)}
+
+    <div class="sect-title">水电抄表<span class="line"></span>
+      <button class="btn btn-sm" data-act="addReading" data-id="${s.id}">＋ 录入抄表</button></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>账期</th><th class="num">水表区间</th><th class="num">用水</th><th class="num">水费</th>
+          <th class="num">电表区间</th><th class="num">用电</th><th class="num">电费</th><th>抄表日</th>
+          ${editable ? '<th style="width:104px">操作</th>' : ''}</tr></thead>
+        <tbody>
+        ${reads.length ? reads.map(r => `<tr>
+          <td class="t-main">${esc(r.period)}</td>
+          <td class="num">${num(r.water_prev)} → ${num(r.water_curr)}</td>
+          <td class="num">${num(r.water_usage)} 吨</td><td class="num">${money(r.water_fee)}</td>
+          <td class="num">${num(r.elec_prev)} → ${num(r.elec_curr)}</td>
+          <td class="num">${num(r.elec_usage)} 度</td><td class="num">${money(r.elec_fee)}</td>
+          <td>${esc(r.read_date || '—')}</td>
+          ${editable ? `<td class="row-act"><button class="btn-link" data-act="editReading" data-id="${r.id}">编辑</button><button class="btn-link danger" data-act="delReading" data-id="${r.id}">删除</button></td>` : ''}</tr>`).join('')
+        : `<tr><td colspan="${editable ? 9 : 8}"><div class="empty">还没有抄表记录</div></td></tr>`}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="sect-title">费用账单<span class="line"></span>
+      <button class="btn btn-sm" data-act="genBill" data-id="${s.id}">＋ 生成月度账单</button></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>账期</th><th class="num">租金</th><th class="num">水费</th><th class="num">电费</th>
+          <th class="num">其他</th><th class="num">合计</th><th>状态</th><th style="width:${editable ? 170 : 90}px">操作</th></tr></thead>
+        <tbody>
+        ${bills.length ? bills.map(b => `<tr>
+          <td class="t-main">${esc(b.period)}</td>
+          <td class="num">${money(b.rent_amount)}</td>
+          <td class="num">${money(b.water_amount)}</td>
+          <td class="num">${money(b.elec_amount)}</td>
+          <td class="num">${money(b.other_amount)}</td>
+          <td class="num"><b>${money(b.total)}</b></td>
+          <td>${b.status === 'paid' ? `<span class="pill ok">已收 ${esc(b.paid_date || '')}</span>` : '<span class="pill warn">未收</span>'}</td>
+          <td class="row-act">${editable ? `<button class="btn-link" data-act="editBill" data-id="${b.id}">编辑</button>` : ''}${b.status === 'paid' ? (editable ? '' : '—') : `<button class="btn-link" data-act="payBill" data-id="${b.id}">登记收款</button>`}${editable ? `<button class="btn-link danger" data-act="delBill" data-id="${b.id}">删除</button>` : ''}</td>
+        </tr>`).join('') : `<tr><td colspan="8"><div class="empty">还没有账单，先录入抄表再生成</div></td></tr>`}
+        </tbody>
+      </table>
+    </div>
+    ${attSection}`;
+}
+
+function openShopDetail(id) {
+  const d = shopDetailData(id);
+  if (!d) return;
+  const s = d.s;
+  openModal({
+    title: s.name,
+    sub: `商铺档案 · ${s.code || ''}`,
+    body: shopDetailInner(d),
+    size: 'lg',
+    footer: `<button class="btn" data-act="closeModal">关闭</button>
+             <button class="btn" data-act="printShop" data-id="${s.id}" title="按 A4 排版打印（也可另存为 PDF）">
+               <svg viewBox="0 0 24 24"><path d="M6 9V3h12v6M6 18H4v-6h16v6h-2M8 14h8v7H8z"/></svg>打印档案</button>
+             <button class="btn" data-act="exportOne" data-module="shops" data-id="${s.id}">导出本铺 Excel</button>
+             <button class="btn" data-act="editShop" data-id="${s.id}">编辑资料</button>`
+  });
+}
+
+/* ---------------- 1.18.0：商铺装修 / 维修进度表单 ---------------- */
+function shopWorkFields() {
+  return [
+    { k: 'type', label: '进度类型', type: 'select', required: true,
+      options: Object.keys(SHOP_WORK_TYPES).map(k => ({ k, n: SHOP_WORK_TYPES[k] })) },
+    { k: 'log_date', label: '日期', type: 'date', required: true },
+    { k: 'title', label: '节点标题', required: true, placeholder: '如：隔墙与水电预埋完成' },
+    { k: 'progress', label: '本次进度（%）', type: 'number', step: '1', required: true,
+      hint: '0 ~ 100，最新一条会同步为商铺当前进度' },
+    { k: 'status', label: '状态', type: 'select', required: true, options: SHOP_WORK_OPTIONS,
+      hint: '未开始 / 待开工 / 进行中 / 已完成 / 已暂停' },
+    { k: 'content', label: '进度说明', type: 'textarea', full: true,
+      placeholder: '记录施工内容、验收情况或待办事项' },
+    { k: 'operator', label: '经办人' }
+  ];
+}
+
+function openShopWorkForm(shopId, type, logId) {
+  const rec = logId ? S.data.shop_progress_logs.find(x => x.id === Number(logId)) : null;
+  if (logId && !rec) return;
+  const sid = rec ? rec.shop_id : Number(shopId);
+  const s = S.data.shops.find(x => x.id === sid);
+  if (!s) return;
+  const tp = rec ? rec.type : (SHOP_WORK_TYPES[type] ? type : 'decoration');
+  const isEdit = !!rec;
+  openForm({
+    title: isEdit ? `编辑${SHOP_WORK_TYPES[tp]}进度` : `添加${SHOP_WORK_TYPES[tp]}进度`,
+    sub: `${s.name} · 当前 ${(SHOP_WORK_STATUS[shopWorkStatus(s, tp)] || [])[0]} ${shopWorkProgress(s, tp)}%`,
+    values: isEdit ? {
+      type: rec.type, log_date: rec.log_date || today(), title: rec.title || '',
+      progress: rec.progress || 0, status: SHOP_WORK_STATUS[rec.status] ? rec.status : 'doing',
+      content: rec.content || '', operator: rec.operator || ''
+    } : {
+      type: tp, log_date: today(), title: '',
+      progress: clamp(shopWorkProgress(s, tp) + 10, 0, 100),
+      status: 'doing', content: '', operator: ''
+    },
+    fields: shopWorkFields(),
+    submitText: isEdit ? '保存修改' : '保存进度',
+    onSubmit: async (v) => {
+      if (isEdit) await api('/shop_progress_logs/' + rec.id, { method: 'PUT', body: v });
+      else await api('/shop_progress_logs', { method: 'POST', body: Object.assign({ shop_id: sid }, v) });
+      toast(isEdit ? '进度已更新' : `${SHOP_WORK_TYPES[tp]}进度已添加`);
+      await refresh(() => openShopDetail(sid));
+    }
+  });
+}
+
+function deleteShopWorkLog(id) {
+  const rec = S.data.shop_progress_logs.find(x => x.id === Number(id));
+  if (!rec) return;
+  const tp = SHOP_WORK_TYPES[rec.type] || '进度';
+  confirmAsk(`删除${tp}进度`,
+    `确定删除「${esc(rec.title || tp + '记录')}」（${esc(rec.log_date || '')}）？<br><br>商铺状态与进度会按剩余记录自动回算，此操作不可恢复。`,
+    async () => {
+      await api('/shop_progress_logs/' + rec.id, { method: 'DELETE' });
+      toast('进度记录已删除');
+      await refresh(() => openShopDetail(rec.shop_id));
+    });
+}
+
+function openShopWorkStatusForm(shopId, type) {
+  const s = S.data.shops.find(x => x.id === Number(shopId));
+  if (!s) return;
+  const tp = SHOP_WORK_TYPES[type] ? type : 'decoration';
+  const cur = shopWorkStatus(s, tp);
+  openForm({
+    title: `编辑${SHOP_WORK_TYPES[tp]}状态`,
+    sub: `${s.name} · 当前 ${(SHOP_WORK_STATUS[cur] || [])[0]} ${shopWorkProgress(s, tp)}%`,
+    values: {
+      status: cur, progress: shopWorkProgress(s, tp), note: '',
+      add_log: '1', log_date: today(), operator: ''
+    },
+    fields: [
+      { k: 'status', label: `${SHOP_WORK_TYPES[tp]}状态`, type: 'select', required: true, options: SHOP_WORK_OPTIONS },
+      { k: 'progress', label: '当前进度（%）', type: 'number', step: '1', required: true, hint: '0 ~ 100' },
+      { k: 'note', label: '变更说明（可选）', type: 'textarea', full: true,
+        placeholder: '如：装修暂停，等待租户重新报批图纸' },
+      { k: 'add_log', label: '同时补记一条进度', type: 'select',
+        options: [{ k: '1', n: '是（推荐）' }, { k: '0', n: '否' }],
+        hint: '选「是」会把本次状态与进度写入时间线，便于追溯' },
+      { k: 'log_date', label: '记录日期', type: 'date' },
+      { k: 'operator', label: '经办人' }
+    ],
+    submitText: '保存状态',
+    onSubmit: async (v) => {
+      await api('/shops/' + s.id + '/work', {
+        method: 'PUT', body: Object.assign({ type: tp, title: `${SHOP_WORK_TYPES[tp]}状态调整` }, v)
+      });
+      toast(`${SHOP_WORK_TYPES[tp]}状态已更新`);
+      await refresh(() => openShopDetail(s.id));
+    }
+  });
+}
+
+/* ============================================================
+   打印（A4，保留页面排版）
+   ============================================================ */
+const PRINT_CSS = [
+  '@page{size:A4 portrait;margin:14mm 13mm}',
+  'html,body{background:#fff !important}',
+  'body.print-doc{font-size:12px;color:#0f172a;margin:0;background:#fff}',
+  '.print-sheet{width:100%;max-width:none}',
+  '.print-doc .print-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;border-bottom:2px solid #1e293b;padding-bottom:8px;margin-bottom:14px}',
+  '.print-doc .ph-title{font-size:18px;font-weight:700;letter-spacing:2px}',
+  '.print-doc .ph-sub{font-size:11.5px;color:#475569;margin-top:2px}',
+  '.print-doc .ph-right{font-size:10.5px;color:#475569;text-align:right;line-height:1.7;white-space:nowrap}',
+  '.print-doc .print-name{font-size:15px;font-weight:650;margin:0 0 10px;display:flex;align-items:baseline;gap:8px}',
+  '.print-doc .print-name span{font-size:11px;color:#64748b;font-weight:400}',
+  '.print-doc .kv{grid-template-columns:repeat(3,1fr);gap:8px 16px}',
+  '.print-doc .kv>div{border-bottom:1px dotted #cbd5e1;padding-bottom:4px}',
+  '.print-doc .kv .k{font-size:10px;color:#64748b}',
+  '.print-doc .kv .v{font-size:12px;color:#0f172a}',
+  '.print-doc .mini-stats{grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}',
+  '.print-doc .mini{padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;background:#f8fafc !important;box-shadow:none}',
+  '.print-doc .mini .k{font-size:10px;color:#64748b}',
+  '.print-doc .mini .v{font-size:13px;color:#0f172a}',
+  '.print-doc .sect-title{margin:14px 0 6px;font-size:12.5px}',
+  '.print-doc .sect-title .line{background:#dbe2ea}',
+  '.print-doc .table-wrap{border:1px solid #cbd5e1;border-radius:6px;overflow:visible;box-shadow:none}',
+  '.print-doc table{font-size:10.5px;width:100%}',
+  '.print-doc th{background:#eef2f7 !important;color:#334155;font-size:10px;padding:5px 6px}',
+  '.print-doc td{padding:5px 6px;color:#0f172a;border-bottom:1px solid #e2e8f0}',
+  '.print-doc .t-sub{color:#64748b}',
+  '.print-doc .btn,.print-doc .btn-link,.print-doc [data-act]{display:none !important}',
+  '.print-doc .pill{font-size:9.5px;padding:0 5px;border:1px solid currentColor;background:#fff !important}',
+  '.print-doc .print-sign{display:flex;justify-content:space-between;gap:20px;margin-top:20px;font-size:11px;color:#334155}',
+  '.print-doc .print-foot{margin-top:12px;padding-top:6px;border-top:1px solid #e2e8f0;font-size:9.5px;color:#94a3b8;text-align:center}',
+  '.print-doc .thumbs{margin-top:8px}',
+  '.print-doc .thumb{border:1px solid #cbd5e1;box-shadow:none;background:#fff !important}',
+  '.print-doc .thumb img{object-fit:cover}',
+  '.print-doc .attach-panel,.print-doc .attach-empty{display:none !important}',
+  '.print-doc .timeline{border-left-color:#cbd5e1;margin-top:8px}',
+  '.print-doc .timeline li{padding-bottom:12px}',
+  '.print-doc .timeline .th b{color:#0f172a}',
+  '.print-doc .timeline .th span{color:#64748b}',
+  '.print-doc .timeline p{color:#334155}',
+  '.print-doc .timeline .pp{color:#334155;background:#f1f5f9 !important;border:1px solid #e2e8f0}',
+  // 1.21.0：商铺 A4 打印稿已不输出装修 / 维修区块，此处仅作兜底，防止旧缓存样式把区块带回打印页
+  '.print-doc .work-panel{display:none !important}',
+  '.print-doc .sect-title{page-break-after:avoid}',
+  '.print-doc tr{page-break-inside:avoid}',
+  '.print-doc .table-wrap{page-break-inside:auto}'
+].join('\n');
+
+function stampNow() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 生成完整的可打印文档（独立 HTML，复制当前样式表，排版与页面一致） */
+function printDocHtml(id) {
+  const d = shopDetailData(id);
+  if (!d) return '';
+  const s = d.s;
+  const st = S.settings || {};
+  const org = String(st.org_name || '').trim();
+  const project = String(st.project_name || '').trim();
+  const owner = [String(st.manager || '').trim(), String(st.phone || '').trim()].filter(Boolean).join(' · ');
+  const appVer = (S.data && S.data.meta && S.data.meta.app && S.data.meta.app.version)
+    || (S.about && S.about.app && S.about.app.version) || '1.7.0';
+  let css = '';
+  try {
+    css = Array.from(document.querySelectorAll('style')).map(el => el.textContent || '').join('\n');
+  } catch (e) { css = ''; }
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<base href="${esc(location.href)}">
+<title>商铺档案 - ${esc(s.name)}</title>
+<style>${css}</style>
+<style>${PRINT_CSS}</style>
+</head>
+<body class="print-doc">
+  <div class="print-sheet">
+    <div class="print-head">
+      <div>
+        <div class="ph-title">商铺档案</div>
+        <div class="ph-sub">${esc([project, org].filter(Boolean).join(' · ') || '物业工程管理')}</div>
+      </div>
+      <div class="ph-right">
+        <div>打印时间 ${esc(stampNow())}</div>
+        ${owner ? `<div>负责人 ${esc(owner)}</div>` : ''}
+      </div>
+    </div>
+    <div class="print-name">${esc(s.name)}${s.code ? `<span>${esc(s.code)}</span>` : ''}</div>
+    ${shopDetailInner(d, { print: true })}
+    <div class="print-sign"><div>制表人：____________</div><div>审核：____________</div><div>日期：____________</div></div>
+    <div class="print-foot">物业工程管理 v${esc(appVer)}${org ? ' · ' + esc(org) : ''}</div>
+  </div>
+</body></html>`;
+}
+
+/** 用隐藏 iframe 打印，避免被拦截弹窗；不影响当前页面状态 */
+/** 通用打印：把独立 HTML 写入离屏 iframe 后调起打印对话框 */
+function printHtmlDoc(html) {
+  let frame = document.getElementById('pmopsPrintFrame');
+  if (frame) frame.remove();
+  frame = document.createElement('iframe');
+  frame.id = 'pmopsPrintFrame';
+  frame.setAttribute('aria-hidden', 'true');
+  frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:900px;height:1200px;border:0;';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+  if (!doc) { toast('当前浏览器不允许直接打印，请用浏览器菜单打印', 'err'); return; }
+  doc.open();
+  doc.write(html);
+  doc.close();
+  setTimeout(() => {
+    try {
+      frame.contentWindow.focus();
+      frame.contentWindow.print();
+    } catch (e) {
+      toast('打印失败：' + (e && e.message ? e.message : e), 'err');
+    }
+  }, 200);
+}
+
+function printShop(id) {
+  const html = printDocHtml(id);
+  if (!html) { toast('商铺不存在或已被删除', 'err'); return; }
+  printHtmlDoc(html);
+}
+
+/** 1.18.0：档案 / 物料等单条记录共用 A4 打印文档骨架 */
+function printRecordDoc(opt) {
+  const st = S.settings || {};
+  const org = String(st.org_name || '').trim();
+  const project = String(st.project_name || '').trim();
+  const owner = [String(st.manager || '').trim(), String(st.phone || '').trim()].filter(Boolean).join(' · ');
+  const appVer = (S.data && S.data.meta && S.data.meta.app && S.data.meta.app.version) || '1.18.0';
+  let css = '';
+  try { css = Array.from(document.querySelectorAll('style')).map(el => el.textContent || '').join('\n'); } catch (e) { css = ''; }
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<base href="${esc(location.href)}">
+<title>${esc(opt.docTitle)} - ${esc(opt.name || '')}</title>
+<style>${css}</style><style>${PRINT_CSS}</style>
+</head><body class="print-doc"><div class="print-sheet">
+  <div class="print-head">
+    <div><div class="ph-title">${esc(opt.docTitle)}</div>
+      <div class="ph-sub">${esc([project, org].filter(Boolean).join(' · ') || '物业工程管理')}</div></div>
+    <div class="ph-right"><div>打印时间 ${esc(stampNow())}</div>${owner ? `<div>负责人 ${esc(owner)}</div>` : ''}</div>
+  </div>
+  <div class="print-name">${esc(opt.name || '')}${opt.sub ? `<span>${esc(opt.sub)}</span>` : ''}</div>
+  ${opt.body || ''}
+  <div class="print-sign"><div>制表人：____________</div><div>审核：____________</div><div>日期：____________</div></div>
+  <div class="print-foot">物业工程管理 v${esc(appVer)}${org ? ' · ' + esc(org) : ''}</div>
+</div></body></html>`;
+}
+
+/** 设备档案打印文档（A4 纵向，与页面排版一致） */
+function printEqHtml(id) {
+  const e = S.data.equipments.find(x => x.id === Number(id));
+  if (!e) return '';
+  const logs = S.data.equipment_logs.filter(l => l.equipment_id === e.id)
+    .sort((a, b) => String(b.log_date).localeCompare(String(a.log_date)));
+  const totalCost = logs.reduce((n, l) => n + (Number(l.cost) || 0), 0);
+  const st = S.settings || {};
+  const org = String(st.org_name || '').trim();
+  const project = String(st.project_name || '').trim();
+  const owner = [String(st.manager || '').trim(), String(st.phone || '').trim()].filter(Boolean).join(' · ');
+  const appVer = (S.data && S.data.meta && S.data.meta.app && S.data.meta.app.version)
+    || (S.about && S.about.app && S.about.app.version) || '1.10.0';
+  let css = '';
+  try {
+    css = Array.from(document.querySelectorAll('style')).map(el => el.textContent || '').join('\n');
+  } catch (err) { css = ''; }
+
+  const eqLogType = EQ_LOG_TYPES;
+  const logRows = logs.length ? logs.map(l => `<tr>
+      <td>${esc(l.log_date || '—')}</td>
+      <td>${esc(eqLogType[l.type] || '记录')}</td>
+      <td>${esc((MAINTAIN_STATUS[String(l.maintain_status || 'done')] || MAINTAIN_STATUS.done)[0])}</td>
+      <td>${esc(l.content || '（无描述）')}</td>
+      <td class="num">${l.cost ? esc(money(l.cost)) : '—'}</td>
+      <td>${esc(l.operator || '—')}</td>
+    </tr>`).join('') : `<tr><td colspan="6"><div class="empty">暂无维保记录</div></td></tr>`;
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<base href="${esc(location.href)}">
+<title>设备档案 - ${esc(e.name)}</title>
+<style>${css}</style>
+<style>${PRINT_CSS}</style>
+</head>
+<body class="print-doc">
+  <div class="print-sheet">
+    <div class="print-head">
+      <div>
+        <div class="ph-title">设备档案</div>
+        <div class="ph-sub">${esc([project, org].filter(Boolean).join(' · ') || '物业工程管理')}</div>
+      </div>
+      <div class="ph-right">
+        <div>打印时间 ${esc(stampNow())}</div>
+        ${owner ? `<div>负责人 ${esc(owner)}</div>` : ''}
+      </div>
+    </div>
+    <div class="print-name">${esc(e.name)}${e.code ? `<span>${esc(e.code)}</span>` : ''}</div>
+    <div class="kv">
+      <div><div class="k">设备编号</div><div class="v">${esc(e.code || '—')}</div></div>
+      <div><div class="k">设备分类</div><div class="v">${esc(CAT[e.category] || '—')}</div></div>
+      <div><div class="k">当前状态</div><div class="v">${esc((EQ_STATUS[e.status] || [e.status || '—'])[0])}</div></div>
+      <div><div class="k">保养状态</div><div class="v">${esc(eqMaintainInfo(e).label)}${eqMaintainInfo(e).manual ? '（手动）' : '（按日期自动）'}</div></div>
+      <div><div class="k">安装位置</div><div class="v">${esc(e.location || '—')}${e.location_type === 'shop' ? '（商铺内）' : ''}</div></div>
+      <div><div class="k">品牌 / 型号</div><div class="v">${esc([e.brand, e.model].filter(Boolean).join(' / ') || '—')}</div></div>
+      <div><div class="k">安装日期</div><div class="v">${esc(e.install_date || '—')}</div></div>
+      <div><div class="k">保修截止</div><div class="v">${esc(e.warranty_end || '—')}</div></div>
+      <div><div class="k">下次保养</div><div class="v">${esc(e.next_maintain || '未设置')}</div></div>
+      <div><div class="k">累计维保成本</div><div class="v">${esc(money(totalCost))}（${logs.length} 条记录）</div></div>
+    </div>
+    <div class="sect-title">巡检 / 维修 / 保养记录<span class="line"></span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>日期</th><th>类型</th><th>保养状态</th><th>内容</th><th>费用</th><th>经办人</th></tr></thead>
+        <tbody>${logRows}</tbody>
+      </table>
+    </div>
+    ${thumbsHtml('equipments', e.id, 6)}
+    ${e.remark ? `<div class="sect-title">备注<span class="line"></span></div><p style="font-size:12px;color:#334155;margin:4px 0 0">${esc(e.remark)}</p>` : ''}
+    <div class="print-sign"><div>制表人：____________</div><div>审核：____________</div><div>日期：____________</div></div>
+    <div class="print-foot">物业工程管理 v${esc(appVer)}${org ? ' · ' + esc(org) : ''}</div>
+  </div>
+</body></html>`;
+}
+
+function printEq(id) {
+  const html = printEqHtml(id);
+  if (!html) { toast('设备不存在或已被删除', 'err'); return; }
+  printHtmlDoc(html);
+}
+
+/** 项目合同打印文档（A4 纵向，与页面排版一致） */
+function printContractHtml(id) {
+  const c = S.data.contracts.find(x => x.id === Number(id));
+  if (!c) return '';
+  const sm = c.summary;
+  const st = S.settings || {};
+  const org = String(st.org_name || '').trim();
+  const project = String(st.project_name || '').trim();
+  const owner = [String(st.manager || '').trim(), String(st.phone || '').trim()].filter(Boolean).join(' · ');
+  const appVer = (S.data && S.data.meta && S.data.meta.app && S.data.meta.app.version)
+    || (S.about && S.about.app && S.about.app.version) || '1.7.0';
+  let css = '';
+  try {
+    css = Array.from(document.querySelectorAll('style')).map(el => el.textContent || '').join('\n');
+  } catch (e) { css = ''; }
+
+  const statusPill = (p) => {
+    const overdue = p.status !== 'paid' && p.due_date && p.due_date < today();
+    if (p.status === 'paid') return '已付 ' + esc(p.paid_date || '');
+    if (overdue) return '已逾期';
+    return (PLAN_STATUS[p.status] || [p.status])[0];
+  };
+  const planRows = c.plans.length ? c.plans.map(p => `<tr>
+      <td class="num">${p.seq}</td>
+      <td><div class="t-main">${esc(p.name)}</div><div class="t-sub">${p.trigger_type === 'progress'
+        ? '施工进度 ≥ ' + esc(p.trigger_value || 100) + '%' : p.trigger_type === 'sign' ? '签约后支付' : '按约定日期'}</div></td>
+      <td class="num">${p.ratio || 0}%</td>
+      <td class="num"><b>${money(p.amount)}</b></td>
+      <td>${esc(p.due_date || '—')}</td>
+      <td>${statusPill(p)}</td>
+      <td class="num">${p.status === 'paid' ? money(p.paid_amount || p.amount) : '—'}</td>
+    </tr>`).join('') : `<tr><td colspan="7"><div class="empty">尚未设置付款计划</div></td></tr>`;
+
+  const payRows = c.payments.length ? c.payments.map(p => `<tr>
+      <td>${esc(p.pay_date || '—')}</td><td class="num"><b>${money(p.amount)}</b></td>
+      <td>${esc(p.method || '—')}</td><td>${esc(p.voucher_no || '—')}</td>
+      <td>${esc(p.operator || '—')}</td><td class="t-sub">${esc(p.remark || '')}</td></tr>`).join('')
+    : `<tr><td colspan="6"><div class="empty">暂无付款记录</div></td></tr>`;
+
+  const progRows = c.progress_logs.length ? `<ul class="timeline">${c.progress_logs.map(g => `
+      <li><div class="th"><b>${esc(g.title || '进度更新')}</b><span>${esc(g.log_date || '')}</span></div>
+        <p>${esc(g.content || '')}</p>
+        <span class="pp">进度 ${g.progress || 0}%</span>
+        ${g.operator ? `<span class="pp" style="background:#f1f5f9;color:var(--muted)">${esc(g.operator)}</span>` : ''}
+      </li>`).join('')}</ul>` : `<div class="empty">暂无进度记录</div>`;
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<base href="${esc(location.href)}">
+<title>项目合同档案 - ${esc(c.name)}</title>
+<style>${css}</style>
+<style>${PRINT_CSS}</style>
+</head>
+<body class="print-doc">
+  <div class="print-sheet">
+    <div class="print-head">
+      <div>
+        <div class="ph-title">项目合同档案</div>
+        <div class="ph-sub">${esc([project, org].filter(Boolean).join(' · ') || '物业工程管理')}</div>
+      </div>
+      <div class="ph-right">
+        <div>打印时间 ${esc(stampNow())}</div>
+        ${owner ? `<div>负责人 ${esc(owner)}</div>` : ''}
+      </div>
+    </div>
+    <div class="print-name">${esc(c.name)}${c.contract_no ? `<span>${esc(c.contract_no)}</span>` : ''}</div>
+
+    <div class="kv">
+      <div><div class="k">合同编号</div><div class="v">${esc(c.contract_no || '—')}</div></div>
+      <div><div class="k">施工方</div><div class="v">${esc(c.contractor)}</div></div>
+      <div><div class="k">联系人</div><div class="v">${esc(c.contact || '—')} ${esc(c.phone || '')}</div></div>
+      <div><div class="k">合同类型</div><div class="v">${CATEGORY_CONTRACT[c.category] || '—'}</div></div>
+      <div><div class="k">签约日期</div><div class="v">${esc(c.sign_date || '—')}</div></div>
+      <div><div class="k">工期</div><div class="v">${esc(c.start_date || '—')} 至 ${esc(c.end_date || '—')}</div></div>
+      <div><div class="k">质保金比例</div><div class="v">${c.retention_rate || 0}%</div></div>
+      <div><div class="k">状态</div><div class="v">${(CONTRACT_STATUS[c.status] || [c.status])[0]}</div></div>
+    </div>
+
+    <div class="mini-stats">
+      <div class="mini"><div class="k">合同总额</div><div class="v">${money(c.amount)}</div></div>
+      <div class="mini"><div class="k">已付款</div><div class="v">${money(sm.paid)}</div></div>
+      <div class="mini"><div class="k">未付款</div><div class="v">${money(sm.unpaid)}</div></div>
+      <div class="mini"><div class="k">施工进度</div><div class="v">${c.progress || 0}%</div></div>
+    </div>
+
+    <div class="sect-title">付款计划<span class="line"></span>
+      <span style="font-size:11.5px;color:#64748b">计划 ${sm.planCount} 期 · 已付 ${sm.paidCount} 期${sm.overdueCount ? ` · 逾期 ${sm.overdueCount} 期` : ''}</span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th class="num">期次</th><th>节点 / 触发条件</th><th class="num">比例</th>
+          <th class="num">金额</th><th>应付日期</th><th>状态</th><th class="num">实付</th></tr></thead>
+        <tbody>${planRows}</tbody>
+      </table>
+    </div>
+
+    <div class="sect-title">施工进度<span class="line"></span></div>
+    ${progRows}
+
+    <div class="sect-title">付款流水<span class="line"></span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>付款日期</th><th class="num">金额</th><th>方式</th><th>凭证号</th><th>经办人</th><th>备注</th></tr></thead>
+        <tbody>${payRows}</tbody>
+      </table>
+    </div>
+
+    ${thumbsHtml('contracts', c.id, 6) ? `<div class="sect-title">现场图片 / 附件<span class="line"></span></div>${thumbsHtml('contracts', c.id, 6)}` : ''}
+    <div class="print-sign"><div>制表人：____________</div><div>审核：____________</div><div>日期：____________</div></div>
+    <div class="print-foot">物业工程管理 v${esc(appVer)}${org ? ' · ' + esc(org) : ''}</div>
+  </div>
+</body></html>`;
+}
+
+function printContract(id) {
+  const html = printContractHtml(id);
+  if (!html) { toast('合同不存在或已被删除', 'err'); return; }
+  printHtmlDoc(html);
+}
+
+function shopForm(id) {
+  const s = id ? S.data.shops.find(x => x.id === Number(id)) : {
+    water_price: (S.settings || {}).water_price,
+    elec_price: (S.settings || {}).elec_price,
+    decoration_status: 'none', decoration_progress: 0,
+    repair_status: 'none', repair_progress: 0
+  };
+  openForm({
+    title: id ? '编辑商铺' : '新增商铺',
+    values: s,
+    fields: [
+      { k: 'name', label: '商铺名称', required: true, placeholder: '如：一层101' },
+      { k: 'code', label: '商铺编号', placeholder: '如：S-101' },
+      { k: 'building', label: '楼栋', type: 'select', options: buildingOptions(s.building),
+        hint: '从楼栋台账中选择；如需新增楼栋，请到「商铺管理 → 楼栋管理」建档' },
+      { k: 'floor', label: '楼层', placeholder: '如：1F' },
+      { k: 'area', label: '建筑面积（㎡）', type: 'number', step: '0.01', required: true },
+      { k: 'rent_price', label: '租金单价（元/㎡/月）', type: 'number', step: '0.01', required: true,
+        hint: '填写月租金总金额后会自动反算；也可直接填写单价' },
+      { k: 'rent_total', label: '月租金总金额（元）', type: 'number', step: '0.01', hintId: 'rentCalcHint',
+        hint: '手动输入整月租金总金额，自动计算租金单价；留空则按 单价 × 面积 自动计算' },
+      { k: 'status', label: '经营状态', type: 'select', options: [{ k: 'rented', n: '在租' }, { k: 'vacant', n: '空置' }, { k: 'maintenance', n: '维修' }] },
+      { k: 'decoration_status', label: '装修状态', type: 'select', options: SHOP_WORK_OPTIONS,
+        hint: '保存后可在商铺详情「＋ 添加装修进度」逐条记录，进度会自动回算状态' },
+      { k: 'repair_status', label: '维修工程状态', type: 'select', options: SHOP_WORK_OPTIONS,
+        hint: '与经营业态「维修」独立；统计栏统一归入「维修」类目' },
+      { k: 'tenant', label: '租户名称' },
+      { k: 'tenant_phone', label: '租户电话' },
+      { k: 'deposit', label: '押金（元）', type: 'number', step: '0.01' },
+      { k: 'lease_start', label: '租期起', type: 'date' },
+      { k: 'lease_end', label: '租期止', type: 'date' },
+      { k: 'water_price', label: '水价（元/吨）', type: 'number', step: '0.01', placeholder: '默认 4.2' },
+      { k: 'elec_price', label: '电价（元/度）', type: 'number', step: '0.01', placeholder: '默认 1.05' },
+      { k: 'remark', label: '备注', type: 'textarea', full: true }
+    ],
+    onSubmit: async (v) => {
+      // 兜底：手动总额存在时按「总额 ÷ 面积」写入单价，保证库内两个字段一致
+      const total = Number(v.rent_total);
+      const area = Number(v.area);
+      if (Number.isFinite(total) && total > 0 && Number.isFinite(area) && area > 0) {
+        v.rent_price = String(round2(total / area));
+      }
+      if (id) await api('/shops/' + id, { method: 'PUT', body: v });
+      else await api('/shops', { method: 'POST', body: v });
+      toast(id ? '商铺已更新' : '商铺已创建');
+      await refresh(() => { if (id) openShopDetail(id); });
+    },
+    onMounted: syncShopRentFields,
+    attach: id ? { entity: 'shops', id: Number(id) } : null
+  });
+}
+
+/* ============================================================
+   设备
+   ============================================================ */
+function viewEquipments() {
+  const all = S.data.equipments;
+  const list = all.filter(e => (S.eqCat === 'all' || e.category === S.eqCat)
+    && (S.eqMaintain === 'all' || eqMaintainKey(e) === S.eqMaintain)
+    && matchQuery(S.eqQuery, [e.name, e.code, e.location, e.brand, e.model,
+      CAT[e.category], (EQ_STATUS[e.status] || [])[0], eqMaintainInfo(e).label, e.remark]));
+  const counts = { all: all.length };
+  Object.keys(CAT).forEach(k => counts[k] = all.filter(e => e.category === k).length);
+  const mtCounts = { all: all.length, normal: 0, planned: 0, doing: 0, done: 0, postponed: 0 };
+  all.forEach(e => { const k = eqMaintainKey(e); if (k in mtCounts) mtCounts[k]++; });
+
+  const toolbar = `
+  <div class="toolbar">
+    <div class="chips">
+      <button class="chip ${S.eqCat === 'all' ? 'active' : ''}" data-act="eqCat" data-k="all">全部<b>${counts.all}</b></button>
+      ${Object.keys(CAT).map(k => `<button class="chip ${S.eqCat === k ? 'active' : ''}" data-act="eqCat" data-k="${k}">${CAT[k]}<b>${counts[k]}</b></button>`).join('')}
+    </div>
+    ${searchBox('eqSearch', '搜索设备 / 编号 / 位置 / 品牌 / 保养状态', S.eqQuery)}
+    ${segHtml('equipments')}
+  </div>
+  <div class="toolbar" style="margin-top:-6px">
+    <span style="font-size:11.5px;color:var(--faint)">保养状态</span>
+    <div class="chips">
+      ${[{ k: 'all', n: '全部' }, { k: 'normal', n: '正常' }, { k: 'planned', n: '待保养' },
+         { k: 'doing', n: '保养中' }, { k: 'done', n: '已完成' }, { k: 'postponed', n: '已延期' }].map(x =>
+        `<button class="chip ${S.eqMaintain === x.k ? 'active' : ''}" data-act="eqMaintainFilter" data-k="${x.k}">${x.n}<b>${mtCounts[x.k]}</b></button>`).join('')}
+    </div>
+    <span class="spacer"></span>
+    <span style="font-size:11px;color:var(--faint)">点「保养」可直接改状态 · 详情里的维保记录支持逐条编辑 / 删除</span>
+  </div>`;
+
+  if (!list.length) {
+    const emptyMsg = S.eqQuery.trim() ? '没有匹配的设备'
+      : S.eqMaintain !== 'all' ? '该保养状态下暂无设备' : '该分类下暂无设备';
+    return toolbar + `<div class="card"><div class="card-body" style="padding:0"><div class="empty">${emptyMsg}</div></div></div>`;
+  }
+
+  if (modeOf('equipments') === 'card') return toolbar + '<div class="egrid">' + list.map(e => {
+    const warn = maintainWarn(e), late = maintainLate(e);
+    const tone = e.status === 'repair' ? 'tone-amber' : e.status === 'stopped' ? '' : 'tone-green';
+    return `<div class="ecard ${tone}" data-act="eq" data-id="${e.id}">
+      <div class="ec-head">
+        <div style="min-width:0">
+          <div class="ec-title">${esc(e.name)}</div>
+          <div class="ec-sub">${esc(e.code || '—')} · ${esc(e.location || '位置未填')}</div>
+        </div>
+        ${pill(EQ_STATUS, e.status)}
+      </div>
+      <div style="margin-bottom:8px">
+        <span class="pill" style="background:${CAT_COLOR[e.category]}14;color:${CAT_COLOR[e.category]}">${CAT[e.category] || '其他'}</span>
+        ${eqMaintainPill(e)}
+      </div>
+      <div class="ec-rows">
+        <div class="ec-row"><span class="k">品牌 / 型号</span><span class="v">${esc([e.brand, e.model].filter(Boolean).join(' / ') || '—')}</span></div>
+        <div class="ec-row"><span class="k">下次保养</span><span class="v" style="${warn ? `color:${late ? 'var(--red)' : 'var(--amber)'};font-weight:600` : ''}">${esc(e.next_maintain || '未设置')}${warn ? (late ? ' · 已到期' : ' · 待保养') : ''}</span></div>
+        <div class="ec-row"><span class="k">安装 / 保修</span><span class="v">${esc(e.install_date || '—')} / ${esc(e.warranty_end || '—')}</span></div>
+      </div>
+      <div class="ec-foot">
+        <button class="btn-link" data-act="eq" data-id="${e.id}">详情</button>
+        <button class="btn-link" data-act="addEqLog" data-id="${e.id}">记录</button>
+        <button class="btn-link" data-act="editEqMaintain" data-id="${e.id}">保养</button>
+        <button class="btn-link" data-act="editEq" data-id="${e.id}">编辑</button>
+        <button class="btn-link danger" data-act="delEq" data-id="${e.id}" style="margin-left:auto">删除</button>
+      </div>
+    </div>`;
+  }).join('') + '</div>';
+
+  return toolbar + `<div class="card"><div class="card-body" style="padding:0">
+    <div class="table-wrap" style="border:none">
+      <table>
+        <thead><tr><th>设备</th><th>分类</th><th>安装位置</th><th>品牌 / 型号</th>
+          <th>状态</th><th>保养状态</th><th>下次保养</th><th style="width:170px">操作</th></tr></thead>
+        <tbody>
+        ${list.map(e => {
+          const warn = maintainWarn(e), late = maintainLate(e);
+          const warnColor = late ? 'var(--red)' : 'var(--amber)';
+          const atts = attsOf('equipments', e.id).length;
+          return `<tr>
+            <td><div class="t-main" style="cursor:pointer" data-act="eq" data-id="${e.id}">${esc(e.name)}</div>
+              <div class="t-sub">${esc(e.code || '—')}${atts ? ` · 附件 ${atts}` : ''}</div></td>
+            <td><span class="pill" style="background:${CAT_COLOR[e.category]}14;color:${CAT_COLOR[e.category]}">${CAT[e.category] || '其他'}</span></td>
+            <td>${esc(e.location || '—')}${e.location_type === 'shop' ? '<div class="t-sub">商铺内</div>' : ''}</td>
+            <td>${esc([e.brand, e.model].filter(Boolean).join(' / ') || '—')}</td>
+            <td>${pill(EQ_STATUS, e.status)}</td>
+            <td>${eqMaintainPill(e)}</td>
+            <td>${e.next_maintain ? `<span style="${warn ? `color:${warnColor};font-weight:600` : ''}">${esc(e.next_maintain)}</span>${warn ? `<div class="t-sub" style="color:${warnColor}">${late ? '已到期' : '待保养'}</div>` : ''}` : '—'}</td>
+            <td><button class="btn-link" data-act="eq" data-id="${e.id}">详情</button>
+                <button class="btn-link" data-act="editEqMaintain" data-id="${e.id}">保养</button>
+                <button class="btn-link" data-act="editEq" data-id="${e.id}">编辑</button>
+                <button class="btn-link danger" data-act="delEq" data-id="${e.id}">删除</button></td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>
+    </div>
+  </div></div>`;
+}
+
+function openEqDetail(id) {
+  const e = S.data.equipments.find(x => x.id === Number(id));
+  if (!e) return;
+  const logs = S.data.equipment_logs.filter(l => l.equipment_id === e.id)
+    .sort((a, b) => String(b.log_date).localeCompare(String(a.log_date)) || (b.id - a.id));
+  const totalCost = logs.reduce((n, l) => n + (Number(l.cost) || 0), 0);
+  const mi = eqMaintainInfo(e);
+  const body = `
+    <div class="kv">
+      <div><div class="k">设备编号</div><div class="v">${esc(e.code || '—')}</div></div>
+      <div><div class="k">分类</div><div class="v">${CAT[e.category] || '—'}</div></div>
+      <div><div class="k">安装位置</div><div class="v">${esc(e.location || '—')}</div></div>
+      <div><div class="k">品牌 / 型号</div><div class="v">${esc([e.brand, e.model].filter(Boolean).join(' / ') || '—')}</div></div>
+      <div><div class="k">安装日期</div><div class="v">${esc(e.install_date || '—')}</div></div>
+      <div><div class="k">保修截止</div><div class="v">${esc(e.warranty_end || '—')}</div></div>
+      <div><div class="k">当前状态</div><div class="v">${pill(EQ_STATUS, e.status)}</div></div>
+      <div><div class="k">保养状态</div><div class="v">${eqMaintainPill(e)}
+        <button class="btn-link" data-act="editEqMaintain" data-id="${e.id}">编辑状态</button></div></div>
+      <div><div class="k">下次保养</div><div class="v">${esc(e.next_maintain || '—')}</div></div>
+      <div><div class="k">累计维保成本</div><div class="v">${money(totalCost)}（${logs.length} 条）</div></div>
+    </div>
+    <div class="sect-title">巡检 / 维修 / 保养记录<span class="line"></span>
+      <button class="btn btn-sm" data-act="addEqLog" data-id="${e.id}">＋ 新增记录</button></div>
+    <p style="font-size:11.5px;color:var(--faint);margin:-4px 0 8px">
+      每条记录都可编辑保养状态、日期、内容与费用；${esc(mi.label)}${mi.manual ? '（手动设定）' : '（按日期自动判断）'}</p>
+    ${logs.length ? `<ul class="timeline">${logs.map(l => `
+      <li>
+        <div class="th"><b>${esc(EQ_LOG_TYPES[l.type] || '记录')}</b>
+          <span>${esc(l.log_date || '')}</span>${logMaintainPill(l)}</div>
+        <p>${esc(l.content || '（无描述）')}${l.cost ? ` · 费用 ${money(l.cost)}` : ''}</p>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          ${l.operator ? `<span class="pp">${esc(l.operator)}</span>` : ''}
+          ${l.next_maintain ? `<span class="pp">下次保养 ${esc(l.next_maintain)}</span>` : ''}
+          <span style="margin-left:auto"></span>
+          <button class="btn-link" data-act="editEqLog" data-id="${l.id}">编辑</button>
+          <button class="btn-link danger" data-act="delEqLog" data-id="${l.id}">删除</button>
+        </div>
+      </li>`).join('')}</ul>` : `<div class="empty">暂无维保记录</div>`}
+    ${attachPanelHtml('equipments', e.id, { empty: '暂无设备照片 / 说明书 / 合格证，点下方按钮上传' })}`;
+  openModal({
+    title: e.name, sub: `设备档案 · ${CAT[e.category] || ''}`, body, size: 'md',
+    footer: `<button class="btn" data-act="closeModal">关闭</button>
+             <button class="btn" data-act="printEq" data-id="${e.id}" title="按 A4 排版打印（也可另存为 PDF）">
+               <svg viewBox="0 0 24 24"><path d="M6 9V3h12v6M6 18H4v-6h16v6h-2M8 14h8v7H8z"/></svg>打印档案</button>
+             <button class="btn" data-act="exportOne" data-module="equipments" data-id="${e.id}">导出本设备 Excel</button>
+             <button class="btn" data-act="editEqMaintain" data-id="${e.id}">编辑保养状态</button>
+             <button class="btn" data-act="editEq" data-id="${e.id}">编辑资料</button>`
+  });
+}
+
+function eqForm(id) {
+  const e = id ? S.data.equipments.find(x => x.id === Number(id)) : { status: 'normal', location_type: 'public' };
+  openForm({
+    title: id ? '编辑设备' : '新增设备',
+    values: e,
+    fields: [
+      { k: 'name', label: '设备名称', required: true, placeholder: '如：喷淋主泵' },
+      { k: 'code', label: '设备编号', placeholder: '如：FIRE-01' },
+      { k: 'category', label: '设备分类', type: 'select', required: true, options: Object.keys(CAT).map(k => ({ k, n: CAT[k] })) },
+      { k: 'status', label: '状态', type: 'select', options: [{ k: 'normal', n: '正常' }, { k: 'repair', n: '维修中' }, { k: 'stopped', n: '停用' }] },
+      { k: 'location', label: '安装位置', placeholder: '如：消防泵房 / A栋一层' },
+      { k: 'location_type', label: '位置类型', type: 'select', options: [{ k: 'public', n: '公共区域' }, { k: 'shop', n: '商铺内' }] },
+      { k: 'brand', label: '品牌' },
+      { k: 'model', label: '型号' },
+      { k: 'install_date', label: '安装日期', type: 'date' },
+      { k: 'warranty_end', label: '保修截止', type: 'date' },
+      { k: 'next_maintain', label: '下次保养日期', type: 'date' },
+      { k: 'remark', label: '备注', type: 'textarea', full: true }
+    ],
+    onSubmit: async (v) => {
+      if (id) await api('/equipments/' + id, { method: 'PUT', body: v });
+      else await api('/equipments', { method: 'POST', body: v });
+      toast(id ? '设备已更新' : '设备已创建');
+      await refresh(() => { if (id) openEqDetail(id); });
+    },
+    attach: id ? { entity: 'equipments', id: Number(id) } : null
+  });
+}
+
+/* ============================================================
+   合同
+   ============================================================ */
+function contractPaid(c) { return c.summary ? c.summary.paid : 0; }
+
+function viewContracts() {
+  const list = S.data.contracts.filter(c => (S.contractStatus === 'all' || c.status === S.contractStatus)
+    && matchQuery(S.contractQuery, [c.name, c.contract_no, c.contractor, c.contact, c.phone,
+      CATEGORY_CONTRACT[c.category], (CONTRACT_STATUS[c.status] || [])[0], c.remark]));
+  const cnt = (k) => S.data.contracts.filter(c => c.status === k).length;
+
+  const toolbar = `
+  <div class="toolbar">
+    <div class="chips">
+      ${[['all', '全部', S.data.contracts.length], ['ongoing', '施工中', cnt('ongoing')], ['paused', '暂停', cnt('paused')],
+        ['done', '已完工', cnt('done')], ['settled', '已结算', cnt('settled')]].map(([k, n, c]) => `
+        <button class="chip ${S.contractStatus === k ? 'active' : ''}" data-act="contractStatus" data-k="${k}">${n}<b>${c}</b></button>`).join('')}
+    </div>
+    ${searchBox('contractSearch', '搜索合同 / 编号 / 施工方', S.contractQuery)}
+    ${segHtml('contracts')}
+  </div>`;
+
+  if (!list.length) {
+    const emptyMsg = S.contractQuery.trim() ? '没有匹配的合同' : '暂无合同';
+    return toolbar + `<div class="card"><div class="card-body" style="padding:0"><div class="empty">${emptyMsg}</div></div></div>`;
+  }
+
+  if (modeOf('contracts') === 'card') return toolbar + '<div class="egrid">' + list.map(c => {
+    const paid = contractPaid(c);
+    const payRatio = c.amount ? Math.round(paid / c.amount * 100) : 0;
+    const tone = c.status === 'done' || c.status === 'settled' ? 'tone-green'
+      : c.status === 'paused' ? 'tone-amber' : c.status === 'ongoing' ? 'tone-brand' : '';
+    const unpaid = Math.max(0, (Number(c.amount) || 0) - paid);
+    const delayed = (c.summary && c.summary.overdueCount) || 0;
+    return `<div class="ecard ${tone}" data-act="contract" data-id="${c.id}">
+      <div class="ec-head">
+        <div style="min-width:0">
+          <div class="ec-title">${esc(c.name)}</div>
+          <div class="ec-sub">${esc(c.contract_no || '—')} · ${CATEGORY_CONTRACT[c.category] || '工程'}</div>
+        </div>
+        ${pill(CONTRACT_STATUS, c.status)}
+      </div>
+      <div class="ec-rows">
+        <div class="ec-row"><span class="k">施工方</span><span class="v">${esc(c.contractor)}</span></div>
+        <div class="ec-row"><span class="k">合同金额</span><span class="v money">${money(c.amount)}</span></div>
+        <div class="ec-row"><span class="k">已付 / 未付</span><span class="v">${money(paid)} / ${money(unpaid)}</span></div>
+        <div class="ec-row"><span class="k">工期</span><span class="v">${esc(c.start_date || '—')} → ${esc(c.end_date || '—')}</span></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:9px">
+        <span style="font-size:11px;color:var(--faint);width:34px">施工</span>
+        <div class="bar" style="flex:1"><i style="width:${clamp(c.progress || 0, 0, 100)}%"></i></div>
+        <span style="font-size:11.5px;color:var(--muted);width:30px;text-align:right">${c.progress || 0}%</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:5px">
+        <span style="font-size:11px;color:var(--faint);width:34px">付款</span>
+        <div class="bar green" style="flex:1"><i style="width:${clamp(payRatio, 0, 100)}%"></i></div>
+        <span style="font-size:11.5px;color:var(--muted);width:30px;text-align:right">${payRatio}%</span>
+      </div>
+      ${delayed ? `<div style="margin-top:7px"><span class="sc-due">逾期 ${delayed} 期</span></div>` : ''}
+      <div class="ec-foot">
+        <button class="btn-link" data-act="contract" data-id="${c.id}">详情</button>
+        <button class="btn-link" data-act="addProgress" data-id="${c.id}">进度</button>
+        <button class="btn-link" data-act="editContract" data-id="${c.id}">编辑</button>
+        <button class="btn-link danger" data-act="delContract" data-id="${c.id}" style="margin-left:auto">删除</button>
+      </div>
+    </div>`;
+  }).join('') + '</div>';
+
+  return toolbar + `<div class="card"><div class="card-body" style="padding:0">
+    <div class="table-wrap" style="border:none">
+      <table>
+        <thead><tr><th>合同</th><th>施工方</th><th>工期</th><th class="num">合同金额</th>
+          <th style="width:150px">施工进度</th><th style="width:150px">付款执行</th><th>状态</th><th style="width:130px">操作</th></tr></thead>
+        <tbody>
+        ${list.map(c => {
+          const paid = contractPaid(c);
+          const payRatio = c.amount ? Math.round(paid / c.amount * 100) : 0;
+          const atts = attsOf('contracts', c.id).length;
+          return `<tr>
+            <td><div class="t-main" style="cursor:pointer" data-act="contract" data-id="${c.id}">${esc(c.name)}</div>
+              <div class="t-sub">${esc(c.contract_no || '—')} · ${CATEGORY_CONTRACT[c.category] || ''}${atts ? ` · 附件 ${atts}` : ''}</div></td>
+            <td>${esc(c.contractor)}<div class="t-sub">${esc(c.contact || '')} ${esc(c.phone || '')}</div></td>
+            <td style="font-size:12px;color:var(--muted)">${esc(c.start_date || '—')}<br>${esc(c.end_date || '—')}</td>
+            <td class="num"><b>${money(c.amount)}</b></td>
+            <td><div style="display:flex;align-items:center;gap:7px">
+              <div class="bar" style="flex:1"><i style="width:${clamp(c.progress || 0, 0, 100)}%"></i></div>
+              <span style="font-size:11.5px;color:var(--muted);width:30px;text-align:right">${c.progress || 0}%</span></div></td>
+            <td><div style="display:flex;align-items:center;gap:7px">
+              <div class="bar green" style="flex:1"><i style="width:${clamp(payRatio, 0, 100)}%"></i></div>
+              <span style="font-size:11.5px;color:var(--muted);width:30px;text-align:right">${payRatio}%</span></div></td>
+            <td>${pill(CONTRACT_STATUS, c.status)}</td>
+            <td><button class="btn-link" data-act="contract" data-id="${c.id}">详情</button>
+                <button class="btn-link" data-act="editContract" data-id="${c.id}">编辑</button>
+                <button class="btn-link danger" data-act="delContract" data-id="${c.id}">删除</button></td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>
+    </div>
+  </div></div>`;
+}
+
+function openContractDetail(id) {
+  const c = S.data.contracts.find(x => x.id === Number(id));
+  if (!c) return;
+  const sm = c.summary;
+  const planRows = c.plans.length ? c.plans.map(p => {
+    const overdue = p.status !== 'paid' && p.due_date && p.due_date < today();
+    const trigger = p.trigger_type === 'progress'
+      ? `施工进度 ≥ ${p.trigger_value || 100}%`
+      : p.trigger_type === 'sign' ? '签约后支付' : '按约定日期';
+    return `<tr>
+      <td class="num">${p.seq}</td>
+      <td><div class="t-main">${esc(p.name)}</div><div class="t-sub">${trigger}</div></td>
+      <td class="num">${p.ratio || 0}%</td>
+      <td class="num"><b>${money(p.amount)}</b></td>
+      <td>${esc(p.due_date || '—')}</td>
+      <td>${p.status === 'paid'
+        ? `<span class="pill ok">已付 ${esc(p.paid_date || '')}</span>`
+        : overdue ? '<span class="pill danger">已逾期</span>' : pill(PLAN_STATUS, p.status)}</td>
+      <td>${p.status === 'paid' ? `<span class="t-sub">${money(p.paid_amount || p.amount)}</span>`
+        : `<button class="btn-link" data-act="payPlan" data-id="${p.id}">登记付款</button>`}
+        <button class="btn-link" data-act="editPlan" data-id="${p.id}" data-contract="${p.contract_id}">编辑</button></td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="7"><div class="empty">尚未设置付款计划</div></td></tr>`;
+
+  const body = `
+    <div class="kv">
+      <div><div class="k">合同编号</div><div class="v">${esc(c.contract_no || '—')}</div></div>
+      <div><div class="k">施工方</div><div class="v">${esc(c.contractor)}</div></div>
+      <div><div class="k">联系人</div><div class="v">${esc(c.contact || '—')} ${esc(c.phone || '')}</div></div>
+      <div><div class="k">合同类型</div><div class="v">${CATEGORY_CONTRACT[c.category] || '—'}</div></div>
+      <div><div class="k">签约日期</div><div class="v">${esc(c.sign_date || '—')}</div></div>
+      <div><div class="k">工期</div><div class="v">${esc(c.start_date || '—')} 至 ${esc(c.end_date || '—')}</div></div>
+      <div><div class="k">质保金比例</div><div class="v">${c.retention_rate || 0}%</div></div>
+      <div><div class="k">状态</div><div class="v">${pill(CONTRACT_STATUS, c.status)}</div></div>
+    </div>
+
+    <div class="mini-stats">
+      <div class="mini"><div class="k">合同总额</div><div class="v">${money(c.amount)}</div></div>
+      <div class="mini"><div class="k">已付款</div><div class="v green">${money(sm.paid)}</div></div>
+      <div class="mini"><div class="k">未付款</div><div class="v red">${money(sm.unpaid)}</div></div>
+      <div class="mini"><div class="k">施工进度</div><div class="v">${c.progress || 0}%</div></div>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:10px;margin:14px 0 4px">
+      <div class="bar" style="flex:1;height:8px"><i style="width:${clamp(c.progress || 0, 0, 100)}%"></i></div>
+      <span style="font-size:12px;color:var(--muted)">施工 ${c.progress || 0}%</span>
+      <div class="bar green" style="flex:1;height:8px"><i style="width:${c.amount ? clamp(sm.paid / c.amount * 100, 0, 100) : 0}%"></i></div>
+      <span style="font-size:12px;color:var(--muted)">付款 ${c.amount ? Math.round(sm.paid / c.amount * 100) : 0}%</span>
+    </div>
+
+    <div class="sect-title">付款计划<span class="line"></span>
+      <span style="font-size:11.5px;color:var(--faint);margin-right:8px">计划 ${sm.planCount} 期 · 已付 ${sm.paidCount} 期${sm.overdueCount ? ` · 逾期 ${sm.overdueCount} 期` : ''}</span>
+      <button class="btn btn-sm" data-act="planBuilder" data-id="${c.id}">自定义付款计划</button>
+      <button class="btn btn-sm" data-act="addPlan" data-id="${c.id}">＋ 追加节点</button></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th class="num">期次</th><th>节点 / 触发条件</th><th class="num">比例</th>
+          <th class="num">金额</th><th>应付日期</th><th>状态</th><th style="width:90px">操作</th></tr></thead>
+        <tbody>${planRows}</tbody>
+      </table>
+    </div>
+
+    <div class="sect-title">施工进度<span class="line"></span>
+      <button class="btn btn-sm" data-act="addProgress" data-id="${c.id}">＋ 上报进度</button></div>
+    ${c.progress_logs.length ? `<ul class="timeline">${c.progress_logs.map(g => `
+      <li><div class="th"><b>${esc(g.title || '进度更新')}</b><span>${esc(g.log_date || '')}</span></div>
+        <p>${esc(g.content || '')}</p>
+        <span class="pp">进度 ${g.progress || 0}%</span>
+        ${g.operator ? `<span class="pp" style="background:#f1f5f9;color:var(--muted)">${esc(g.operator)}</span>` : ''}
+      </li>`).join('')}</ul>` : `<div class="empty">暂无进度记录</div>`}
+
+    <div class="sect-title">付款流水<span class="line"></span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>付款日期</th><th class="num">金额</th><th>方式</th><th>凭证号</th><th>经办人</th><th>备注</th></tr></thead>
+        <tbody>${c.payments.length ? c.payments.map(p => `<tr>
+          <td>${esc(p.pay_date || '—')}</td><td class="num"><b>${money(p.amount)}</b></td>
+          <td>${esc(p.method || '—')}</td><td>${esc(p.voucher_no || '—')}</td>
+          <td>${esc(p.operator || '—')}</td><td class="t-sub">${esc(p.remark || '')}</td></tr>`).join('')
+          : `<tr><td colspan="6"><div class="empty">暂无付款记录</div></td></tr>`}</tbody>
+      </table>
+    </div>
+
+    ${attachPanelHtml('contracts', c.id, { empty: '暂无合同扫描件 / 现场照片，点下方按钮上传' })}`;
+
+  openModal({
+    title: c.name,
+    sub: `${c.contract_no || ''} · ${c.contractor}`,
+    body, size: 'xl',
+    footer: `<button class="btn" data-act="closeModal">关闭</button>
+             <button class="btn" data-act="printContract" data-id="${c.id}" title="按 A4 排版打印（也可另存为 PDF）">
+               <svg viewBox="0 0 24 24"><path d="M6 9V3h12v6M6 18H4v-6h16v6h-2M8 14h8v7H8z"/></svg>打印合同</button>
+             <button class="btn" data-act="exportOne" data-module="contracts" data-id="${c.id}">导出本合同 Excel</button>
+             <button class="btn" data-act="editContract" data-id="${c.id}">编辑合同</button>`
+  });
+}
+
+const PLAN_TEMPLATES = {
+  standard: [
+    { name: '首付款', ratio: 30, trigger_type: 'sign' },
+    { name: '进度款（进度50%）', ratio: 30, trigger_type: 'progress', trigger_value: '50' },
+    { name: '进度款（进度80%）', ratio: 30, trigger_type: 'progress', trigger_value: '80' },
+    { name: '质保金（竣工验收）', ratio: 10, trigger_type: 'progress', trigger_value: '100' }
+  ],
+  half: [
+    { name: '首付款', ratio: 50, trigger_type: 'sign' },
+    { name: '竣工款', ratio: 45, trigger_type: 'progress', trigger_value: '100' },
+    { name: '质保金', ratio: 5, trigger_type: 'progress', trigger_value: '100' }
+  ],
+  custom: [],
+  none: []
+};
+
+/* ============================================================
+   自定义付款计划（新建合同 / 已有合同通用）
+   ============================================================ */
+const PLAN_TRIGGERS = [
+  { k: 'sign', n: '签约即付' }, { k: 'progress', n: '按施工进度' }, { k: 'date', n: '按约定日期' }
+];
+
+function newPlanRow(seq) {
+  return { id: null, name: `第${seq}期`, amount: '', ratio: '', trigger_type: 'date',
+    trigger_value: '', due_date: '', remark: '', locked: false };
+}
+
+/** 编辑器字段联动：金额 ⇄ 比例按合同总额自动换算，返回需要同步写入的另一字段 */
+function planDraftEdit(draft, idx, key, value) {
+  const row = draft.rows[idx];
+  if (!row || row.locked) return null;
+  row[key] = value;
+  const total = Number(draft.total) || 0;
+  if (key === 'amount' && total > 0) {
+    const a = Number(value);
+    row.ratio = a > 0 ? String(Math.round(a / total * 1000) / 10) : '';
+    return { k: 'ratio', v: row.ratio };
+  }
+  if (key === 'ratio' && total > 0) {
+    const r = Number(value);
+    row.amount = r > 0 ? String(round2(total * r / 100)) : '';
+    return { k: 'amount', v: row.amount };
+  }
+  return null;
+}
+
+function planDraftTotals(draft) {
+  const rows = draft.rows || [];
+  const amount = round2(rows.reduce((n, r) => n + (Number(r.amount) || 0), 0));
+  const ratio = Math.round(rows.reduce((n, r) => n + (Number(r.ratio) || 0), 0) * 10) / 10;
+  return { count: rows.length, amount, ratio, left: round2((Number(draft.total) || 0) - amount) };
+}
+
+/** 行操作（纯函数，便于测试）：添加 / 删除 / 上移 / 下移 / 套模板 / 均分 / 清空 */
+function planDraftAction(draft, act, idx, key) {
+  const rows = draft.rows;
+  const total = Number(draft.total) || 0;
+  if (act === 'planAdd') { rows.push(newPlanRow(rows.length + 1)); return true; }
+  if (act === 'planClear') { draft.rows = rows.filter(r => r.locked); return true; }
+  if (act === 'planEven') {
+    const free = rows.filter(r => !r.locked);
+    if (!free.length) return false;
+    const used = rows.filter(r => r.locked).reduce((n, r) => n + (Number(r.amount) || 0), 0);
+    const left = total - used;
+    if (left <= 0) return false;
+    const each = round2(left / free.length);
+    free.forEach((r, i) => {
+      r.amount = String(i === free.length - 1 ? round2(left - each * (free.length - 1)) : each);
+      r.ratio = total > 0 ? String(Math.round(Number(r.amount) / total * 1000) / 10) : '';
+    });
+    return true;
+  }
+  if (act === 'planTpl') {
+    const tpl = PLAN_TEMPLATES[key] || [];
+    const kept = rows.filter(r => r.locked);
+    draft.rows = kept.concat(tpl.map((p, i) => {
+      const ratio = Number(p.ratio) || 0;
+      return { id: null, name: p.name, ratio: String(ratio),
+        amount: String(round2(total * ratio / 100)), trigger_type: p.trigger_type,
+        trigger_value: p.trigger_value || '', due_date: p.trigger_type === 'sign' ? '' : (draft.endDate || ''),
+        remark: '', locked: false };
+    }));
+    return true;
+  }
+  if (idx == null || !rows[idx]) return false;
+  if (act === 'planDel') { if (rows[idx].locked) return false; rows.splice(idx, 1); return true; }
+  const swap = (j) => {
+    if (j < 0 || j >= rows.length || rows[j].locked || rows[idx].locked) return false;
+    const t = rows[idx]; rows[idx] = rows[j]; rows[j] = t; return true;
+  };
+  if (act === 'planUp') return swap(idx - 1);
+  if (act === 'planDown') return swap(idx + 1);
+  return false;
+}
+
+/** 保存时把草稿转成接口所需的节点规格 */
+function planDraftSpecs(draft) {
+  return draft.rows.map((r, i) => ({
+    id: r.id || undefined,
+    seq: i + 1,
+    name: String(r.name || `第${i + 1}期`).trim(),
+    amount: round2(Number(r.amount) || 0),
+    ratio: Number(r.ratio) || 0,
+    trigger_type: r.trigger_type || 'date',
+    trigger_value: r.trigger_value || '',
+    due_date: r.due_date || '',
+    remark: r.remark || ''
+  }));
+}
+
+function planSummaryHtml(draft) {
+  const ts = planDraftTotals(draft);
+  return `
+      <div class="pb-stat"><div class="k">合同总额</div><div class="v">${money(draft.total)}</div></div>
+      <div class="pb-stat"><div class="k">已排期数</div><div class="v">${ts.count} 期</div></div>
+      <div class="pb-stat"><div class="k">计划金额合计</div><div class="v">${money(ts.amount)}</div></div>
+      <div class="pb-stat"><div class="k">比例合计</div><div class="v">${ts.ratio}%</div></div>
+      <div class="pb-stat"><div class="k">${ts.left < 0 ? '超出合同总额' : '待分配金额'}</div>
+        <div class="v ${ts.left < 0 ? 'warn' : ''}">${money(Math.abs(ts.left))}</div></div>`;
+}
+
+function planDraftHtml(draft) {
+  const inp = (i, k, v, type, extra, lock) =>
+    `<input data-pk="${k}" data-row="${i}" type="${type || 'text'}" value="${esc(v == null ? '' : v)}" ${extra || ''}${lock ? ' disabled' : ''}>`;
+  const rows = draft.rows.map((r, i) => {
+    const lock = !!r.locked;
+    const sel = `<select data-pk="trigger_type" data-row="${i}"${lock ? ' disabled' : ''}>${PLAN_TRIGGERS
+      .map(o => `<option value="${o.k}"${o.k === r.trigger_type ? ' selected' : ''}>${o.n}</option>`).join('')}</select>`;
+    return `<tr class="${lock ? 'locked' : ''}">
+      <td class="num">${i + 1}${lock ? '<div class="t-sub">已付</div>' : ''}</td>
+      <td>${inp(i, 'name', r.name, 'text', '', lock)}</td>
+      <td class="num-col">${inp(i, 'amount', r.amount, 'number', 'step="0.01" min="0"', lock)}</td>
+      <td class="num-col">${inp(i, 'ratio', r.ratio, 'number', 'step="0.1" min="0"', lock)}</td>
+      <td>${sel}</td>
+      <td class="num-col">${inp(i, 'trigger_value', r.trigger_value, 'number', 'step="1" min="0" placeholder="进度%"', lock)}</td>
+      <td class="date-col">${inp(i, 'due_date', r.due_date, 'date', '', lock)}</td>
+      <td>${inp(i, 'remark', r.remark, 'text', '', lock)}</td>
+      <td class="act-col">
+        <button data-act="planUp" data-row="${i}" title="上移"${lock || i === 0 ? ' disabled' : ''}>↑</button>
+        <button data-act="planDown" data-row="${i}" title="下移"${lock || i === draft.rows.length - 1 ? ' disabled' : ''}>↓</button>
+        <button data-act="planDel" data-row="${i}" title="删除"${lock ? ' disabled' : ''}>✕</button>
+      </td>
+    </tr>`;
+  }).join('');
+  return `
+    <div class="pb-summary" id="pbSummary">${planSummaryHtml(draft)}</div>
+    <div class="pb-tools">
+      <button class="btn btn-sm" data-act="planAdd">＋ 添加一期</button>
+      <button class="btn btn-sm" data-act="planEven">按剩余金额均分</button>
+      <button class="btn btn-sm" data-act="planTpl" data-k="standard">套用标准四期</button>
+      <button class="btn btn-sm" data-act="planTpl" data-k="half">套用三期模板</button>
+      <button class="btn btn-sm" data-act="planClear">清空未付节点</button>
+    </div>
+    <div class="pb-wrap"><table class="pb-table">
+      <thead><tr><th>期次</th><th>节点名称</th><th>金额（元）</th><th>比例（%）</th>
+        <th>触发方式</th><th>进度阈值</th><th>应付日期</th><th>备注</th><th>操作</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="9"><div class="pb-empty">暂无付款节点，点上方「＋ 添加一期」开始编排</div></td></tr>'}</tbody>
+    </table></div>
+    <div class="pb-note">金额与比例双向联动（按合同总额自动换算）；触发方式选「按施工进度」时请填进度阈值。已付款节点以灰色显示、仅保留期次，不可修改金额或删除，付款流水与附件均不受影响。</div>`;
+}
+
+function renderPlanBuilder(keep) {
+  const d = S.planDraft;
+  if (!d) return;
+  openModal({
+    keepReturn: !!keep,
+    title: '自定义付款计划',
+    sub: `${d.title} · 合同总额 ${money(d.total)}`,
+    size: 'xl',
+    body: planDraftHtml(d),
+    footer: `<button class="btn" data-act="closeModal">取消</button>
+             <button class="btn btn-primary" data-act="planSave">保存付款计划</button>`
+  });
+}
+
+function openPlanBuilder(contractId) {
+  const c = contractId ? S.data.contracts.find(x => x.id === Number(contractId)) : null;
+  const form = $('.modal-body form');
+  const vals = {};
+  if (form && form.querySelectorAll) {
+    Array.from(form.querySelectorAll('[data-k]') || []).forEach(el => { vals[el.dataset.k] = el.value; });
+  }
+  const total = c ? (Number(c.amount) || 0) : (Number(vals.amount) || 0);
+  const rows = c
+    ? (c.plans || []).map(p => ({ id: p.id, name: p.name, amount: p.amount, ratio: p.ratio,
+        trigger_type: p.trigger_type, trigger_value: p.trigger_value || '', due_date: p.due_date || '',
+        remark: p.remark || '', locked: p.status === 'paid' }))
+    : (S.pendingPlans || []).map(p => Object.assign({}, p, { locked: false }));
+  if (!rows.length && !c) rows.push(newPlanRow(1));
+  S.planDraft = { contractId: c ? c.id : null, title: c ? c.name : (vals.name || '新合同'),
+    total, endDate: c ? (c.end_date || '') : (vals.end_date || ''), rows };
+  S.planFormValues = c ? null : vals;
+  renderPlanBuilder(false);
+  S.formSubmit = null; // 编辑器期间不响应上层表单的 Ctrl+Enter
+  if (!total) toast('提示：尚未填写合同总额，金额与比例联动暂不可用', 'err');
+}
+
+/** 回退到合同表单后，恢复用户已填写但未保存的字段值 */
+function restorePlanForm() {
+  const vals = S.planFormValues;
+  S.planFormValues = null;
+  const form = $('.modal-body form');
+  if (!form || !vals) return;
+  Object.keys(vals).forEach(k => {
+    const el = form.querySelector(`[data-k="${k}"]`);
+    if (el) el.value = vals[k];
+  });
+}
+
+async function savePlanBuilder() {
+  const d = S.planDraft;
+  if (!d) return;
+  const specs = planDraftSpecs(d);
+  if (!specs.length) { toast('请至少添加一期付款节点', 'err'); return; }
+  if (specs.some(s => !s.name || !(s.amount > 0))) {
+    toast('每期请填写节点名称与大于 0 的金额', 'err'); return;
+  }
+  if (d.contractId) {
+    await api('/contracts/' + d.contractId + '/plans/batch', { method: 'POST', body: { plans: specs } });
+    const cid = d.contractId;
+    S.planDraft = null;
+    toast(`付款计划已保存（${specs.length} 期）`);
+    S.modalReturn = null;
+    closeModal();
+    await refresh(() => openContractDetail(cid));
+  } else {
+    S.pendingPlans = specs;
+    S.planDraft = null;
+    toast(`自定义付款计划已设置（${specs.length} 期）`);
+    closeModal();
+    restorePlanForm();
+    const sel = document.querySelector('.modal-body form [data-k="__template"]');
+    if (sel) sel.value = 'custom';
+    const info = $('#planPendingInfo');
+    if (info) info.textContent = `${specs.length} 期 · 合计 ${money(planDraftTotals({ total: d.total, rows: specs }).amount)}`;
+  }
+}
+
+function contractForm(id) {
+  const c = id ? S.data.contracts.find(x => x.id === Number(id)) : {};
+  const shopOptions = [{ k: '', n: '不关联商铺' }].concat(S.data.shops.map(s => ({ k: s.id, n: s.name })));
+  openForm({
+    title: id ? '编辑合同' : '新增工程合同',
+    values: c,
+    fields: [
+      { k: 'name', label: '合同名称', required: true, placeholder: '如：A栋外墙翻新工程', full: true },
+      { k: 'contract_no', label: '合同编号', placeholder: '如：HT-2026-012' },
+      { k: 'contractor', label: '施工方', required: true, placeholder: '公司全称' },
+      { k: 'contact', label: '联系人' },
+      { k: 'phone', label: '联系电话' },
+      { k: 'category', label: '合同类型', type: 'select', options: Object.keys(CATEGORY_CONTRACT).map(k => ({ k, n: CATEGORY_CONTRACT[k] })) },
+      { k: 'shop_id', label: '关联商铺', type: 'select', options: shopOptions },
+      { k: 'amount', label: '合同总额（元）', type: 'number', step: '0.01', required: true },
+      { k: 'sign_date', label: '签约日期', type: 'date' },
+      { k: 'start_date', label: '开工日期', type: 'date' },
+      { k: 'end_date', label: '竣工日期', type: 'date' },
+      { k: 'retention_rate', label: '质保金比例（%）', type: 'number', step: '0.1' },
+      { k: 'status', label: '状态', type: 'select', options: Object.keys(CONTRACT_STATUS).map(k => ({ k, n: CONTRACT_STATUS[k][0] })) },
+      { k: 'progress', label: '当前进度（%）', type: 'number', step: '1' },
+      { k: 'remark', label: '备注', type: 'textarea', full: true }
+    ].concat(id ? [] : [{
+      k: '__template', label: '付款计划模板', type: 'select', full: true,
+      options: [{ k: 'standard', n: '标准四期：首付 30% / 进度 50% 付 30% / 进度 80% 付 30% / 质保金 10%' },
+        { k: 'half', n: '首付 50% / 竣工 45% / 质保金 5%' },
+        { k: 'custom', n: '自定义付款计划（自行编排期次、金额与触发条件）' },
+        { k: 'none', n: '暂不生成，后续手动添加' }]
+    }]),
+    extra: id ? '' : `<div class="plan-pending">
+      <span>自定义付款计划：<b id="planPendingInfo">${S.pendingPlans && S.pendingPlans.length
+        ? `${S.pendingPlans.length} 期 · 合计 ${money(planDraftTotals({ total: 0, rows: S.pendingPlans }).amount)}` : '未设置'}</b></span>
+      <button type="button" class="btn btn-sm" data-act="planBuilderNew">编辑自定义计划…</button>
+      <span class="t-sub">选择「自定义付款计划」模板后，此处编排的节点会随合同一起创建</span>
+    </div>`,
+    submitText: id ? '保存' : '创建合同',
+    onSubmit: async (v) => {
+      const tpl = v.__template || 'standard';
+      delete v.__template;
+      if (!id) {
+        let plans;
+        if (tpl === 'custom') {
+          if (!S.pendingPlans || !S.pendingPlans.length) {
+            throw new Error('请先点「编辑自定义计划…」添加至少一期付款节点');
+          }
+          plans = S.pendingPlans.map(p => Object.assign({}, p));
+        } else {
+          plans = PLAN_TEMPLATES[tpl].map(p => Object.assign({}, p, {
+            due_date: p.trigger_type === 'sign' ? addDays(v.sign_date, 7) : (v.end_date || '')
+          }));
+        }
+        v.plans = plans;
+        const created = await api('/contracts', { method: 'POST', body: v });
+        S.pendingPlans = null;
+        toast(created.plans && created.plans.length
+          ? `合同已创建，已生成 ${created.plans.length} 期付款计划`
+          : '合同已创建');
+      } else {
+        await api('/contracts/' + id, { method: 'PUT', body: v });
+        toast('合同已更新');
+      }
+      await refresh(() => openContractDetail(id || (S.data.contracts[0] && S.data.contracts[0].id)));
+    },
+    attach: id ? { entity: 'contracts', id: Number(id) } : null
+  });
+}
+
+/* ============================================================
+   项目付款台帐
+   ============================================================ */
+function allPlans() {
+  const map = {};
+  S.data.contracts.forEach(c => map[c.id] = c);
+  return S.data.payment_plans.map(p => Object.assign({}, p, { contract: map[p.contract_id] }))
+    .sort((a, b) => String(a.due_date || '9999-12-31').localeCompare(String(b.due_date || '9999-12-31')));
+}
+
+function viewPayments() {
+  const plans = allPlans();
+  const isOverdue = (p) => p.status !== 'paid' && p.due_date && p.due_date < today();
+  const total = plans.reduce((n, p) => n + (Number(p.amount) || 0), 0);
+  const paid = plans.filter(p => p.status === 'paid').reduce((n, p) => n + (Number(p.paid_amount) || Number(p.amount) || 0), 0);
+  const due = plans.filter(p => p.status !== 'paid').reduce((n, p) => n + (Number(p.amount) || 0), 0);
+  const overdue = plans.filter(isOverdue).length;
+
+  const filtered = plans.filter(p => {
+    const st = S.payFilter === 'all' ? true
+      : S.payFilter === 'overdue' ? isOverdue(p)
+      : p.status === S.payFilter;
+    if (!st) return false;
+    const c = p.contract || {};
+    return matchQuery(S.payQuery, [p.name, c.name, c.contract_no, c.contractor,
+      p.remark, p.voucher_no, p.method, (PLAN_STATUS[p.status] || [])[0]]);
+  });
+  const emptyMsg = S.payQuery.trim() ? '没有匹配的付款节点' : '该条件下没有付款节点';
+
+  const toolbar = `
+  <div class="toolbar">
+    <div class="chips">
+      ${[['all', '全部', plans.length], ['due', '待支付', plans.filter(p => p.status === 'due').length],
+        ['pending', '未到期', plans.filter(p => p.status === 'pending').length],
+        ['paid', '已支付', plans.filter(p => p.status === 'paid').length],
+        ['overdue', '逾期', overdue]].map(([k, n, c]) => `
+        <button class="chip ${S.payFilter === k ? 'active' : ''}" data-act="payFilter" data-k="${k}">${n}<b>${c}</b></button>`).join('')}
+    </div>
+    ${searchBox('paySearch', '搜索付款节点 / 合同 / 施工方', S.payQuery)}
+    ${segHtml('payments')}
+  </div>`;
+
+  if (modeOf('payments') === 'card') return `
+  <div class="stats" style="grid-template-columns:repeat(4,1fr)">
+    <div class="stat"><div class="lbl">应付总额</div><div class="val">${moneyShort(total)}</div><div class="sub">共 ${plans.length} 个付款节点</div></div>
+    <div class="stat green"><div class="lbl">已支付</div><div class="val">${moneyShort(paid)}</div><div class="sub">占应付 ${total ? Math.round(paid / total * 100) : 0}%</div></div>
+    <div class="stat amber"><div class="lbl">待支付</div><div class="val">${moneyShort(due)}</div><div class="sub">含未到期与已到期</div></div>
+    <div class="stat"><div class="lbl">逾期节点</div><div class="val" style="color:${overdue ? 'var(--red)' : 'inherit'}">${overdue}<small>笔</small></div><div class="sub">需尽快处理</div></div>
+  </div>` + toolbar + (filtered.length ? '<div class="egrid">' + filtered.map(p => {
+    const c = p.contract || {};
+    const over = isOverdue(p);
+    const tone = p.status === 'paid' ? 'tone-green' : over ? 'tone-red' : p.status === 'due' ? 'tone-amber' : '';
+    const trigger = p.trigger_type === 'progress' ? `进度 ≥ ${p.trigger_value || 100}%`
+      : p.trigger_type === 'sign' ? '签约后' : '约定日期';
+    return `<div class="ecard ${tone}" data-act="editPlan" data-id="${p.id}" data-contract="${p.contract_id}">
+      <div class="ec-head">
+        <div style="min-width:0">
+          <div class="ec-title">${esc(p.name)}</div>
+          <div class="ec-sub">第 ${p.seq} 期 · ${esc(c.name || '—')}</div>
+        </div>
+        ${p.status === 'paid' ? `<span class="pill ok">已支付</span>` : over ? '<span class="pill danger">逾期</span>' : pill(PLAN_STATUS, p.status)}
+      </div>
+      <div class="ec-rows">
+        <div class="ec-row"><span class="k">金额</span><span class="v money">${money(p.amount)}</span></div>
+        <div class="ec-row"><span class="k">应付日期</span><span class="v" style="${over ? 'color:var(--red)' : ''}">${esc(p.due_date || '—')}</span></div>
+        <div class="ec-row"><span class="k">触发条件</span><span class="v">${trigger}</span></div>
+        <div class="ec-row"><span class="k">施工方</span><span class="v">${esc(c.contractor || '—')}</span></div>
+        ${p.status === 'paid' ? `<div class="ec-row"><span class="k">付款日期</span><span class="v">${esc(p.paid_date || '—')} · ${money(p.paid_amount || p.amount)}</span></div>` : ''}
+      </div>
+      <div class="ec-foot">
+        <button class="btn-link" data-act="editPlan" data-id="${p.id}" data-contract="${p.contract_id}">编辑</button>
+        <button class="btn-link" data-act="contract" data-id="${p.contract_id}">合同</button>
+        ${p.status === 'paid' ? '' : `<button class="btn-link" data-act="payPlan" data-id="${p.id}" style="margin-left:auto;font-weight:600">登记付款</button>`}
+      </div>
+    </div>`;
+  }).join('') + '</div>' : `<div class="card"><div class="card-body" style="padding:0"><div class="empty">${emptyMsg}</div></div></div>`);
+
+  return `
+  <div class="stats" style="grid-template-columns:repeat(4,1fr)">
+    <div class="stat"><div class="lbl">应付总额</div><div class="val">${moneyShort(total)}</div><div class="sub">共 ${plans.length} 个付款节点</div></div>
+    <div class="stat green"><div class="lbl">已支付</div><div class="val">${moneyShort(paid)}</div><div class="sub">占应付 ${total ? Math.round(paid / total * 100) : 0}%</div></div>
+    <div class="stat amber"><div class="lbl">待支付</div><div class="val">${moneyShort(due)}</div><div class="sub">含未到期与已到期</div></div>
+    <div class="stat"><div class="lbl">逾期节点</div><div class="val" style="color:${overdue ? 'var(--red)' : 'inherit'}">${overdue}<small>笔</small></div><div class="sub">需尽快处理</div></div>
+  </div>
+  ${toolbar}
+  <div class="card"><div class="card-body" style="padding:0">
+    <div class="table-wrap" style="border:none">
+      <table>
+        <thead><tr><th>合同</th><th class="num">期次</th><th>付款节点</th><th class="num">金额</th>
+          <th>应付日期</th><th>状态</th><th style="width:150px">操作</th></tr></thead>
+        <tbody>
+        ${filtered.length ? filtered.map(p => {
+          const c = p.contract || {};
+          const over = isOverdue(p);
+          const trigger = p.trigger_type === 'progress' ? `进度 ≥ ${p.trigger_value || 100}%`
+            : p.trigger_type === 'sign' ? '签约后' : '约定日期';
+          const atts = attsOf('payment_plans', p.id).length;
+          return `<tr>
+            <td><div class="t-main" style="cursor:pointer" data-act="contract" data-id="${p.contract_id}">${esc(c.name || '—')}</div>
+              <div class="t-sub">${esc(c.contractor || '')}</div></td>
+            <td class="num">${p.seq}</td>
+            <td><div class="t-main">${esc(p.name)}</div><div class="t-sub">${trigger}${atts ? ` · 附件 ${atts}` : ''}</div></td>
+            <td class="num"><b>${money(p.amount)}</b></td>
+            <td>${esc(p.due_date || '—')}${over ? '<div class="t-sub" style="color:var(--red)">已逾期</div>' : ''}</td>
+            <td>${p.status === 'paid' ? `<span class="pill ok">已付 ${esc(p.paid_date || '')}</span>` : over ? '<span class="pill danger">逾期</span>' : pill(PLAN_STATUS, p.status)}</td>
+            <td>
+              <button class="btn-link" data-act="editPlan" data-id="${p.id}" data-contract="${p.contract_id}">编辑</button>
+              ${p.status === 'paid' ? '' : `<button class="btn-link" data-act="payPlan" data-id="${p.id}">登记付款</button>`}
+            </td>
+          </tr>`;
+        }).join('') : `<tr><td colspan="7"><div class="empty">${emptyMsg}</div></td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  </div></div>`;
+}
+
+/* ============================================================
+   档案管理（1.18.0）
+   ============================================================ */
+const archiveAll = () => (S.data && S.data.archives) || [];
+const archiveLogsOf = (id) => ((S.data && S.data.archive_logs) || [])
+  .filter(x => x.archive_id === Number(id))
+  .sort((a, b) => String(b.log_date || '').localeCompare(String(a.log_date || '')) || (b.id - a.id));
+function entityName(entity, id) {
+  if (!entity || !id) return '';
+  const t = ARCHIVE_ENTITY[entity] ? entity : '';
+  if (!t || !S.data[t]) return '';
+  const row = S.data[t].find(x => x.id === Number(id));
+  return row ? (row.title || row.name || row.code || ('#' + id)) : '';
+}
+function archiveExpiryInfo(a) {
+  if (!a.expiry) return { label: '长期', tone: 'muted', late: false };
+  if (a.expiry < today()) return { label: '已到期 ' + a.expiry, tone: 'danger', late: true };
+  if (a.expiry <= addDays(today(), 60)) return { label: '即将到期 ' + a.expiry, tone: 'warn', late: false };
+  return { label: a.expiry, tone: 'muted', late: false };
+}
+
+function viewArchives() {
+  const all = archiveAll();
+  const list = all.filter(a => (S.archiveCat === 'all' || a.category === S.archiveCat)
+    && (S.archiveStatus === 'all' || a.status === S.archiveStatus)
+    && matchQuery(S.archiveQuery, [a.code, a.title, ARCHIVE_CAT[a.category], a.keeper, a.location,
+      a.security, (ARCHIVE_STATUS[a.status] || [])[0], a.remark, entityName(a.entity, a.entity_id)]));
+  const cnt = k => all.filter(a => a.category === k).length;
+  const borrowed = all.filter(a => a.status === 'borrowed').length;
+  const expiring = all.filter(a => archiveExpiryInfo(a).tone === 'warn' || archiveExpiryInfo(a).late).length;
+  const attCount = (S.data.attachments || []).filter(x => x.entity === 'archives').length;
+
+  const toolbar = `
+  <div class="stats" style="grid-template-columns:repeat(4,1fr)">
+    <div class="stat"><div class="lbl">档案总数</div><div class="val">${all.length}<small>卷</small></div><div class="sub">全部归档资料</div></div>
+    <div class="stat violet"><div class="lbl">当前借出</div><div class="val">${borrowed}<small>卷</small></div><div class="sub">借阅登记自动回写状态</div></div>
+    <div class="stat amber"><div class="lbl">到期提醒</div><div class="val">${expiring}<small>卷</small></div><div class="sub">60 天内到期或已过期</div></div>
+    <div class="stat green"><div class="lbl">扫描件附件</div><div class="val">${attCount}<small>个</small></div><div class="sub">随档案归档的电子文件</div></div>
+  </div>
+  <div class="toolbar">
+    <div class="chips">
+      <button class="chip ${S.archiveCat === 'all' ? 'active' : ''}" data-act="archiveCat" data-k="all">全部<b>${all.length}</b></button>
+      ${Object.keys(ARCHIVE_CAT).map(k => `<button class="chip ${S.archiveCat === k ? 'active' : ''}" data-act="archiveCat" data-k="${k}">${ARCHIVE_CAT[k]}<b>${cnt(k)}</b></button>`).join('')}
+    </div>
+    ${searchBox('archiveSearch', '搜索档案 / 编号 / 保管人 / 位置', S.archiveQuery)}
+    ${segHtml('archives')}
+  </div>
+  <div class="toolbar" style="margin-top:-6px">
+    <span style="font-size:11.5px;color:var(--faint)">档案状态</span>
+    <div class="chips">
+      <button class="chip ${S.archiveStatus === 'all' ? 'active' : ''}" data-act="archiveStatus" data-k="all">全部</button>
+      ${ARCHIVE_STATUS_OPTIONS.map(o => `<button class="chip ${S.archiveStatus === o.k ? 'active' : ''}" data-act="archiveStatus" data-k="${o.k}">${o.n}<b>${all.filter(a => a.status === o.k).length}</b></button>`).join('')}
+    </div>
+    <span class="spacer"></span>
+    <span style="font-size:11px;color:var(--faint)">借阅 / 归还登记会自动更新「在档 / 借出」状态</span>
+  </div>`;
+
+  if (!list.length) {
+    return toolbar + `<div class="card"><div class="card-body" style="padding:0"><div class="empty">${S.archiveQuery.trim() ? '没有匹配的档案' : '该筛选条件下暂无档案'}</div></div></div>`;
+  }
+
+  if (modeOf('archives') === 'card') return toolbar + '<div class="egrid">' + list.map(a => {
+    const ex = archiveExpiryInfo(a);
+    const tone = a.status === 'borrowed' ? 'tone-amber' : a.status === 'void' ? 'tone-red' : 'tone-brand';
+    return `<div class="ecard ${tone}" data-act="archive" data-id="${a.id}">
+      <div class="ec-head"><div style="min-width:0">
+        <div class="ec-title">${esc(a.title)}</div>
+        <div class="ec-sub">${esc(a.code || '—')} · ${esc(ARCHIVE_CAT[a.category] || '其他')}</div>
+      </div>${pill(ARCHIVE_STATUS, a.status)}</div>
+      <div class="ec-rows">
+        <div class="ec-row"><span class="k">存放位置</span><span class="v">${esc(a.location || '—')}</span></div>
+        <div class="ec-row"><span class="k">保管人 / 密级</span><span class="v">${esc(a.keeper || '—')} · ${esc(ARCHIVE_SECURITY[a.security] || '普通')}</span></div>
+        <div class="ec-row"><span class="k">归档 / 有效期</span><span class="v" style="${ex.late ? 'color:var(--red);font-weight:600' : ''}">${esc(a.archive_date || '—')} · ${esc(ex.label)}</span></div>
+      </div>
+      <div class="ec-foot">
+        <button class="btn-link" data-act="archive" data-id="${a.id}">详情</button>
+        <button class="btn-link" data-act="addArchiveLog" data-id="${a.id}" data-type="borrow">借阅</button>
+        <button class="btn-link" data-act="editArchive" data-id="${a.id}">编辑</button>
+        <button class="btn-link danger" data-act="delArchive" data-id="${a.id}" style="margin-left:auto">删除</button>
+      </div>
+    </div>`;
+  }).join('') + '</div>';
+
+  return toolbar + `<div class="card"><div class="card-body" style="padding:0">
+    <div class="table-wrap" style="border:none"><table>
+      <thead><tr><th>档案编号 / 题名</th><th>分类</th><th>关联对象</th><th>归档日期</th>
+        <th>保管人 / 位置</th><th>密级</th><th>状态</th><th>有效期</th><th style="width:150px">操作</th></tr></thead>
+      <tbody>${list.map(a => {
+        const ex = archiveExpiryInfo(a);
+        const rel = entityName(a.entity, a.entity_id);
+        return `<tr>
+          <td><div class="t-main" style="cursor:pointer" data-act="archive" data-id="${a.id}">${esc(a.title)}</div><div class="t-sub">${esc(a.code || '—')}</div></td>
+          <td>${esc(ARCHIVE_CAT[a.category] || '其他')}</td>
+          <td>${rel ? esc((ARCHIVE_ENTITY[a.entity] || '') + ' · ' + rel) : '<span style="color:var(--faint)">—</span>'}</td>
+          <td>${esc(a.archive_date || '—')}</td>
+          <td>${esc(a.keeper || '—')}<div class="t-sub">${esc(a.location || '')}</div></td>
+          <td>${esc(ARCHIVE_SECURITY[a.security] || '普通')}</td>
+          <td>${pill(ARCHIVE_STATUS, a.status)}</td>
+          <td style="${ex.late ? 'color:var(--red);font-weight:600' : ''}">${esc(ex.label)}</td>
+          <td><button class="btn-link" data-act="archive" data-id="${a.id}">详情</button>
+            <button class="btn-link" data-act="addArchiveLog" data-id="${a.id}" data-type="borrow">借阅</button>
+            <button class="btn-link" data-act="editArchive" data-id="${a.id}">编辑</button>
+            <button class="btn-link danger" data-act="delArchive" data-id="${a.id}">删除</button></td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table></div>
+  </div></div>`;
+}
+
+function openArchiveDetail(id) {
+  const a = archiveAll().find(x => x.id === Number(id));
+  if (!a) return;
+  const logs = archiveLogsOf(a.id);
+  const ex = archiveExpiryInfo(a);
+  const rel = entityName(a.entity, a.entity_id);
+  const body = `
+    <div class="kv">
+      <div><div class="k">档案编号</div><div class="v">${esc(a.code || '—')}</div></div>
+      <div><div class="k">档案分类</div><div class="v">${esc(ARCHIVE_CAT[a.category] || '其他')}</div></div>
+      <div><div class="k">状态</div><div class="v">${pill(ARCHIVE_STATUS, a.status)}</div></div>
+      <div><div class="k">密级</div><div class="v">${esc(ARCHIVE_SECURITY[a.security] || '普通')}</div></div>
+      <div><div class="k">归档日期</div><div class="v">${esc(a.archive_date || '—')}</div></div>
+      <div><div class="k">有效期</div><div class="v" style="${ex.late ? 'color:var(--red);font-weight:600' : ''}">${esc(ex.label)}</div></div>
+      <div><div class="k">保管人</div><div class="v">${esc(a.keeper || '—')}</div></div>
+      <div><div class="k">存放位置</div><div class="v">${esc(a.location || '—')}</div></div>
+      <div><div class="k">份数</div><div class="v">${num(a.qty || 1)} 份</div></div>
+      <div><div class="k">关联对象</div><div class="v">${rel ? esc((ARCHIVE_ENTITY[a.entity] || '') + ' · ' + rel) : '—'}</div></div>
+    </div>
+    ${a.remark ? `<div style="margin-top:12px;font-size:12.5px;color:var(--muted)">备注：${esc(a.remark)}</div>` : ''}
+    <div class="sect-title">借阅 / 归还记录<span class="line"></span>
+      <button class="btn btn-sm" data-act="addArchiveLog" data-id="${a.id}" data-type="borrow">＋ 借阅登记</button>
+      <button class="btn btn-sm" data-act="addArchiveLog" data-id="${a.id}" data-type="return">＋ 归还登记</button></div>
+    ${logs.length ? `<ul class="timeline">${logs.map(l => `
+      <li><div class="th"><b>${esc(ARCHIVE_LOG_TYPE[l.type] || '记录')}</b>
+        <span>${esc(l.log_date || '')}</span></div>
+        <p>${esc(l.person || '')}${l.purpose ? ' · ' + esc(l.purpose) : ''}${l.due_date ? ' · 应还 ' + esc(l.due_date) : ''}</p>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          ${l.remark ? `<span class="pp">${esc(l.remark)}</span>` : ''}<span style="margin-left:auto"></span>
+          <button class="btn-link" data-act="editArchiveLog" data-id="${l.id}">编辑</button>
+          <button class="btn-link danger" data-act="delArchiveLog" data-id="${l.id}">删除</button>
+        </div>
+      </li>`).join('')}</ul>` : `<div class="empty">暂无借阅 / 归还记录</div>`}
+    ${attachPanelHtml('archives', a.id, { empty: '暂无档案扫描件，点下方按钮上传' })}`;
+  openModal({
+    title: a.title, sub: `${ARCHIVE_CAT[a.category] || '档案'} · ${a.code || ''}`,
+    body, size: 'lg',
+    footer: `<button class="btn" data-act="closeModal">关闭</button>
+      <button class="btn" data-act="printArchive" data-id="${a.id}">打印档案卡</button>
+      <button class="btn" data-act="exportOne" data-module="archives" data-id="${a.id}">导出本档案 Excel</button>
+      <button class="btn" data-act="addArchiveLog" data-id="${a.id}" data-type="borrow">借阅登记</button>
+      <button class="btn" data-act="editArchive" data-id="${a.id}">编辑资料</button>`
+  });
+}
+
+function archiveFields() {
+  return [
+    { k: 'title', label: '档案题名', required: true, placeholder: '如：A栋外墙翻新工程施工合同', full: true },
+    { k: 'code', label: '档案编号', placeholder: '如：DA-2026-001' },
+    { k: 'category', label: '档案分类', type: 'select', required: true, options: ARCHIVE_CAT_OPTIONS },
+    { k: 'entity', label: '关联对象类型', type: 'select',
+      options: Object.keys(ARCHIVE_ENTITY).map(k => ({ k, n: ARCHIVE_ENTITY[k] })), hint: '可不填' },
+    { k: 'entity_id', label: '关联记录 ID', type: 'number', step: '1', hint: '填写业务表记录编号，便于追溯' },
+    { k: 'archive_date', label: '归档日期', type: 'date' },
+    { k: 'expiry', label: '有效期 / 复审日', type: 'date', hint: '证照类档案到期前 60 天提醒' },
+    { k: 'keeper', label: '保管人' },
+    { k: 'location', label: '存放位置', placeholder: '如：档案室 A-01' },
+    { k: 'security', label: '密级', type: 'select',
+      options: Object.keys(ARCHIVE_SECURITY).map(k => ({ k, n: ARCHIVE_SECURITY[k] })) },
+    { k: 'status', label: '档案状态', type: 'select', options: ARCHIVE_STATUS_OPTIONS,
+      hint: '借阅 / 归还流水会自动回写「在档 / 借出」' },
+    { k: 'qty', label: '份数', type: 'number', step: '1' },
+    { k: 'remark', label: '备注', type: 'textarea', full: true }
+  ];
+}
+
+function archiveForm(id) {
+  const a = id ? archiveAll().find(x => x.id === Number(id)) : null;
+  if (id && !a) return;
+  openForm({
+    title: id ? '编辑档案' : '新增档案',
+    sub: id ? `${a.code || ''} · 借阅记录与扫描件保持不变` : '归档后可上传扫描件并登记借阅',
+    values: a || { category: 'contract', status: 'filed', security: 'internal', archive_date: today(), qty: 1 },
+    fields: archiveFields(),
+    onSubmit: async (v) => {
+      if (id) await api('/archives/' + id, { method: 'PUT', body: v });
+      else await api('/archives', { method: 'POST', body: v });
+      toast(id ? '档案已更新' : '档案已归档');
+      await refresh(() => { if (id) openArchiveDetail(id); });
+    },
+    attach: id ? { entity: 'archives', id: Number(id) } : null
+  });
+}
+
+function archiveLogFields() {
+  return [
+    { k: 'type', label: '记录类型', type: 'select', required: true,
+      options: Object.keys(ARCHIVE_LOG_TYPE).map(k => ({ k, n: ARCHIVE_LOG_TYPE[k] })) },
+    { k: 'log_date', label: '日期', type: 'date', required: true },
+    { k: 'person', label: '借阅 / 归还人', required: true, placeholder: '如：招商部 林经理' },
+    { k: 'due_date', label: '应还日期', type: 'date', hint: '借阅时填写，归还可留空' },
+    { k: 'purpose', label: '用途', full: true, placeholder: '如：租户续约核对租期与押金条款' },
+    { k: 'remark', label: '备注', type: 'textarea', full: true }
+  ];
+}
+
+function openArchiveLogForm(archiveId, type, logId) {
+  const rec = logId ? ((S.data.archive_logs || []).find(x => x.id === Number(logId))) : null;
+  if (logId && !rec) return;
+  const aid = rec ? rec.archive_id : Number(archiveId);
+  const a = archiveAll().find(x => x.id === aid);
+  if (!a) return;
+  const tp = rec ? rec.type : (ARCHIVE_LOG_TYPE[type] ? type : 'borrow');
+  const isEdit = !!rec;
+  openForm({
+    title: isEdit ? '编辑借阅 / 归还记录' : `${ARCHIVE_LOG_TYPE[tp]}登记`,
+    sub: `${a.title} · ${a.code || ''}`,
+    values: isEdit ? {
+      type: rec.type, log_date: rec.log_date || today(), person: rec.person || '',
+      due_date: rec.due_date || '', purpose: rec.purpose || '', remark: rec.remark || ''
+    } : {
+      type: tp, log_date: today(), person: '',
+      due_date: tp === 'borrow' ? addDays(today(), 7) : '', purpose: '', remark: ''
+    },
+    fields: archiveLogFields(),
+    submitText: isEdit ? '保存修改' : '保存登记',
+    onSubmit: async (v) => {
+      if (isEdit) await api('/archive_logs/' + rec.id, { method: 'PUT', body: v });
+      else await api('/archive_logs', { method: 'POST', body: Object.assign({ archive_id: aid }, v) });
+      toast(isEdit ? '借阅记录已更新' : `${ARCHIVE_LOG_TYPE[tp]}登记成功`);
+      await refresh(() => openArchiveDetail(aid));
+    }
+  });
+}
+
+function deleteArchiveLog(id) {
+  const rec = (S.data.archive_logs || []).find(x => x.id === Number(id));
+  if (!rec) return;
+  confirmAsk('删除借阅记录',
+    `确定删除 ${esc(ARCHIVE_LOG_TYPE[rec.type] || '记录')}（${esc(rec.log_date || '')}）？<br><br>档案状态会按剩余流水自动回算，此操作不可恢复。`,
+    async () => {
+      await api('/archive_logs/' + rec.id, { method: 'DELETE' });
+      toast('借阅记录已删除');
+      await refresh(() => openArchiveDetail(rec.archive_id));
+    });
+}
+
+function printArchiveHtml(id) {
+  const a = archiveAll().find(x => x.id === Number(id));
+  if (!a) return '';
+  const logs = archiveLogsOf(a.id);
+  const ex = archiveExpiryInfo(a);
+  const rel = entityName(a.entity, a.entity_id);
+  const atts = attsOf('archives', a.id);
+  const body = `
+    <div class="kv">
+      <div><div class="k">档案编号</div><div class="v">${esc(a.code || '—')}</div></div>
+      <div><div class="k">档案分类</div><div class="v">${esc(ARCHIVE_CAT[a.category] || '其他')}</div></div>
+      <div><div class="k">状态</div><div class="v">${pill(ARCHIVE_STATUS, a.status)}</div></div>
+      <div><div class="k">密级</div><div class="v">${esc(ARCHIVE_SECURITY[a.security] || '普通')}</div></div>
+      <div><div class="k">归档日期</div><div class="v">${esc(a.archive_date || '—')}</div></div>
+      <div><div class="k">有效期</div><div class="v">${esc(ex.label)}</div></div>
+      <div><div class="k">保管人</div><div class="v">${esc(a.keeper || '—')}</div></div>
+      <div><div class="k">存放位置</div><div class="v">${esc(a.location || '—')}</div></div>
+      <div><div class="k">份数</div><div class="v">${num(a.qty || 1)} 份</div></div>
+      <div><div class="k">关联对象</div><div class="v">${rel ? esc((ARCHIVE_ENTITY[a.entity] || '') + ' · ' + rel) : '—'}</div></div>
+    </div>
+    ${a.remark ? `<div style="margin-top:12px;font-size:12.5px;color:var(--muted)">备注：${esc(a.remark)}</div>` : ''}
+    <div class="sect-title">借阅 / 归还记录<span class="line"></span></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>日期</th><th>类型</th><th>经办人</th><th>应还日期</th><th>用途 / 备注</th></tr></thead>
+      <tbody>${logs.length ? logs.map(l => `<tr><td>${esc(l.log_date || '')}</td>
+        <td>${esc(ARCHIVE_LOG_TYPE[l.type] || '记录')}</td><td>${esc(l.person || '')}</td>
+        <td>${esc(l.due_date || '—')}</td><td>${esc([l.purpose, l.remark].filter(Boolean).join(' · ') || '—')}</td></tr>`).join('')
+        : `<tr><td colspan="5"><div class="empty">暂无借阅 / 归还记录</div></td></tr>`}</tbody>
+    </table></div>
+    ${atts.length ? `<div class="sect-title">档案扫描件<span class="line"></span></div>${thumbsHtml('archives', a.id, 6)}` : ''}`;
+  return printRecordDoc({ docTitle: '档案卡片', name: a.title, sub: a.code || '', body });
+}
+function printArchive(id) {
+  const html = printArchiveHtml(id);
+  if (!html) { toast('档案不存在或已被删除', 'err'); return; }
+  printHtmlDoc(html);
+}
+
+/* ============================================================
+   仓库管理（1.18.0）
+   ============================================================ */
+const whAll = () => (S.data && S.data.warehouse_items) || [];
+const whValue = (i) => round2((Number(i.quantity) || 0) * (Number(i.unit_price) || 0));
+
+function viewWarehouse() {
+  const all = whAll();
+  const list = all.filter(i => (S.warehouseCat === 'all' || i.category === S.warehouseCat)
+    && (S.warehouseFilter === 'low' ? whLowStock(i)
+      : S.warehouseFilter === 'stopped' ? i.status === 'stopped'
+      : S.warehouseFilter === 'normal' ? i.status !== 'stopped' && !whLowStock(i) : true)
+    && matchQuery(S.warehouseQuery, [i.code, i.name, i.spec, i.location, i.supplier,
+      WH_CAT[i.category], (WH_ITEM_STATUS[i.status] || [])[0], i.remark]));
+  const cnt = k => all.filter(i => i.category === k).length;
+  const low = all.filter(whLowStock).length;
+  const totalValue = all.reduce((n, i) => n + whValue(i), 0);
+  const monthStart = today().slice(0, 7);
+  const monthMoves = ((S.data && S.data.warehouse_records) || [])
+    .filter(r => String(r.log_date || '').startsWith(monthStart)).length;
+
+  const toolbar = `
+  <div class="stats" style="grid-template-columns:repeat(4,1fr)">
+    <div class="stat"><div class="lbl">物料种类</div><div class="val">${all.length}<small>项</small></div><div class="sub">在册仓库物料</div></div>
+    <div class="stat amber"><div class="lbl">低库存预警</div><div class="val">${low}<small>项</small></div><div class="sub">结存 ≤ 安全库存</div></div>
+    <div class="stat green"><div class="lbl">库存总金额</div><div class="val">${moneyShort(totalValue)}</div><div class="sub">按结存 × 单价估算</div></div>
+    <div class="stat violet"><div class="lbl">本月出入库</div><div class="val">${monthMoves}<small>笔</small></div><div class="sub">含入库 / 出库 / 盘点</div></div>
+  </div>
+  <div class="toolbar">
+    <div class="chips">
+      <button class="chip ${S.warehouseCat === 'all' ? 'active' : ''}" data-act="whCat" data-k="all">全部<b>${all.length}</b></button>
+      ${Object.keys(WH_CAT).map(k => `<button class="chip ${S.warehouseCat === k ? 'active' : ''}" data-act="whCat" data-k="${k}">${WH_CAT[k]}<b>${cnt(k)}</b></button>`).join('')}
+    </div>
+    ${searchBox('whSearch', '搜索物料 / 编号 / 规格 / 库位 / 供应商', S.warehouseQuery)}
+    ${segHtml('warehouse')}
+  </div>
+  <div class="toolbar" style="margin-top:-6px">
+    <span style="font-size:11.5px;color:var(--faint)">库存状态</span>
+    <div class="chips">
+      ${[{ k: 'all', n: '全部', c: all.length }, { k: 'normal', n: '库存充足', c: all.filter(i => i.status !== 'stopped' && !whLowStock(i)).length },
+         { k: 'low', n: '低库存', c: low }, { k: 'stopped', n: '已停用', c: all.filter(i => i.status === 'stopped').length }]
+        .map(x => `<button class="chip ${S.warehouseFilter === x.k ? 'active' : ''}" data-act="whFilter" data-k="${x.k}">${x.n}<b>${x.c}</b></button>`).join('')}
+    </div>
+    <span class="spacer"></span>
+    <span style="font-size:11px;color:var(--faint)">出库超出结存会被拒绝 · 编辑 / 删除流水自动重算结存</span>
+  </div>`;
+
+  if (!list.length) {
+    return toolbar + `<div class="card"><div class="card-body" style="padding:0"><div class="empty">${S.warehouseQuery.trim() ? '没有匹配的物料' : '该筛选条件下暂无物料'}</div></div></div>`;
+  }
+
+  if (modeOf('warehouse') === 'card') return toolbar + '<div class="egrid">' + list.map(i => {
+    const warn = whLowStock(i);
+    return `<div class="ecard ${warn ? 'tone-red' : i.status === 'stopped' ? '' : 'tone-green'}" data-act="whItem" data-id="${i.id}">
+      <div class="ec-head"><div style="min-width:0">
+        <div class="ec-title">${esc(i.name)}</div>
+        <div class="ec-sub">${esc(i.code || '—')} · ${esc(i.spec || '—')}</div>
+      </div>${warn ? '<span class="pill danger">低库存</span>' : pill(WH_ITEM_STATUS, i.status)}</div>
+      <div style="margin-bottom:8px"><span class="pill" style="background:${WH_CAT_COLOR[i.category] || '#64748b'}14;color:${WH_CAT_COLOR[i.category] || '#64748b'}">${esc(WH_CAT[i.category] || '其他')}</span></div>
+      <div class="ec-rows">
+        <div class="ec-row"><span class="k">当前结存</span><span class="v ${warn ? 'stock-warn' : 'stock-ok'}">${num(i.quantity)} ${esc(i.unit || '')}</span></div>
+        <div class="ec-row"><span class="k">安全库存 / 单价</span><span class="v">${num(i.min_stock)} ${esc(i.unit || '')} · ${money(i.unit_price)}</span></div>
+        <div class="ec-row"><span class="k">库位 / 供应商</span><span class="v">${esc(i.location || '—')} · ${esc(i.supplier || '—')}</span></div>
+      </div>
+      <div class="ec-foot">
+        <button class="btn-link" data-act="whItem" data-id="${i.id}">详情</button>
+        <button class="btn-link" data-act="addWhRecord" data-id="${i.id}" data-type="in">入库</button>
+        <button class="btn-link" data-act="addWhRecord" data-id="${i.id}" data-type="out">出库</button>
+        <button class="btn-link" data-act="editWhItem" data-id="${i.id}">编辑</button>
+        <button class="btn-link danger" data-act="delWhItem" data-id="${i.id}" style="margin-left:auto">删除</button>
+      </div>
+    </div>`;
+  }).join('') + '</div>';
+
+  return toolbar + `<div class="card"><div class="card-body" style="padding:0">
+    <div class="table-wrap" style="border:none"><table>
+      <thead><tr><th>物料 / 编号</th><th>分类</th><th>规格</th><th>库位</th>
+        <th class="num">结存</th><th class="num">安全库存</th><th class="num">单价</th><th class="num">库存金额</th><th>状态</th><th style="width:170px">操作</th></tr></thead>
+      <tbody>${list.map(i => {
+        const warn = whLowStock(i);
+        return `<tr>
+          <td><div class="t-main" style="cursor:pointer" data-act="whItem" data-id="${i.id}">${esc(i.name)}</div><div class="t-sub">${esc(i.code || '—')}</div></td>
+          <td>${esc(WH_CAT[i.category] || '其他')}</td><td>${esc(i.spec || '—')}</td><td>${esc(i.location || '—')}</td>
+          <td class="num ${warn ? 'stock-warn' : ''}"><b>${num(i.quantity)}</b> ${esc(i.unit || '')}${warn ? ' ⚠' : ''}</td>
+          <td class="num">${num(i.min_stock)}</td><td class="num">${money(i.unit_price)}</td>
+          <td class="num">${money(whValue(i))}</td>
+          <td>${warn ? '<span class="pill danger">低库存</span>' : pill(WH_ITEM_STATUS, i.status)}</td>
+          <td><button class="btn-link" data-act="whItem" data-id="${i.id}">详情</button>
+            <button class="btn-link" data-act="addWhRecord" data-id="${i.id}" data-type="in">入库</button>
+            <button class="btn-link" data-act="addWhRecord" data-id="${i.id}" data-type="out">出库</button>
+            <button class="btn-link" data-act="editWhItem" data-id="${i.id}">编辑</button>
+            <button class="btn-link danger" data-act="delWhItem" data-id="${i.id}">删除</button></td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table></div>
+  </div></div>`;
+}
+
+function openWhDetail(id) {
+  const i = whAll().find(x => x.id === Number(id));
+  if (!i) return;
+  const recs = whRecords(i.id);
+  const warn = whLowStock(i);
+  const inTotal = recs.filter(r => r.type === 'in').reduce((n, r) => n + (Number(r.quantity) || 0), 0);
+  const outTotal = recs.filter(r => r.type === 'out').reduce((n, r) => n + (Number(r.quantity) || 0), 0);
+  const body = `
+    <div class="kv">
+      <div><div class="k">物料编号</div><div class="v">${esc(i.code || '—')}</div></div>
+      <div><div class="k">分类 / 规格</div><div class="v">${esc(WH_CAT[i.category] || '其他')} · ${esc(i.spec || '—')}</div></div>
+      <div><div class="k">状态</div><div class="v">${warn ? '<span class="pill danger">低库存</span>' : pill(WH_ITEM_STATUS, i.status)}</div></div>
+      <div><div class="k">当前结存</div><div class="v ${warn ? 'stock-warn' : 'stock-ok'}">${num(i.quantity)} ${esc(i.unit || '')}</div></div>
+      <div><div class="k">期初 / 安全库存</div><div class="v">${num(i.opening)} / ${num(i.min_stock)} ${esc(i.unit || '')}</div></div>
+      <div><div class="k">库存上限</div><div class="v">${num(i.max_stock)} ${esc(i.unit || '')}</div></div>
+      <div><div class="k">单价 / 库存金额</div><div class="v">${money(i.unit_price)} / ${money(whValue(i))}</div></div>
+      <div><div class="k">库位</div><div class="v">${esc(i.location || '—')}</div></div>
+      <div><div class="k">供应商</div><div class="v">${esc(i.supplier || '—')}</div></div>
+      <div><div class="k">累计入库 / 出库</div><div class="v">${num(inTotal)} / ${num(outTotal)} ${esc(i.unit || '')}</div></div>
+    </div>
+    ${i.remark ? `<div style="margin-top:12px;font-size:12.5px;color:var(--muted)">备注：${esc(i.remark)}</div>` : ''}
+    <div class="sect-title">出入库 / 盘点流水<span class="line"></span>
+      <button class="btn btn-sm" data-act="addWhRecord" data-id="${i.id}" data-type="in">＋ 入库</button>
+      <button class="btn btn-sm" data-act="addWhRecord" data-id="${i.id}" data-type="out">＋ 出库</button>
+      <button class="btn btn-sm" data-act="addWhRecord" data-id="${i.id}" data-type="adjust">＋ 盘点</button></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>日期</th><th>类型</th><th class="num">数量</th><th class="num">单价</th>
+        <th class="num">金额</th><th class="num">结存</th><th>经办 / 用途</th><th style="width:100px">操作</th></tr></thead>
+      <tbody>${recs.length ? recs.map(r => `<tr>
+        <td>${esc(r.log_date || '')}</td><td>${pill(WH_RECORD_TYPE, r.type)}</td>
+        <td class="num">${num(r.quantity)} ${esc(i.unit || '')}</td><td class="num">${money(r.unit_price)}</td>
+        <td class="num">${money(r.amount)}</td><td class="num"><b>${num(r.balance)}</b></td>
+        <td>${esc(r.person || '—')}<div class="t-sub">${esc(r.purpose || r.related || '')}</div></td>
+        <td class="row-act"><button class="btn-link" data-act="editWhRecord" data-id="${r.id}">编辑</button>
+          <button class="btn-link danger" data-act="delWhRecord" data-id="${r.id}">删除</button></td>
+      </tr>`).join('') : `<tr><td colspan="8"><div class="empty">暂无出入库流水，先登记一笔入库或盘点</div></td></tr>`}</tbody>
+    </table></div>
+    ${attachPanelHtml('warehouse_items', i.id, { empty: '暂无物料照片 / 合格证，点下方按钮上传' })}`;
+  openModal({
+    title: i.name, sub: `物料台账 · ${i.code || ''}`, body, size: 'lg',
+    footer: `<button class="btn" data-act="closeModal">关闭</button>
+      <button class="btn" data-act="printWhItem" data-id="${i.id}">打印物料卡</button>
+      <button class="btn" data-act="exportOne" data-module="warehouse" data-id="${i.id}">导出本物料 Excel</button>
+      <button class="btn" data-act="addWhRecord" data-id="${i.id}" data-type="adjust">盘点调整</button>
+      <button class="btn" data-act="editWhItem" data-id="${i.id}">编辑资料</button>`
+  });
+}
+
+function whFields(isEdit) {
+  return [
+    { k: 'name', label: '物料名称', required: true, full: true, placeholder: '如：LED 平板灯 600×600' },
+    { k: 'code', label: '物料编号', placeholder: '如：WL-001' },
+    { k: 'category', label: '物料分类', type: 'select', required: true, options: WH_CAT_OPTIONS },
+    { k: 'spec', label: '规格型号', placeholder: '如：18W / 220V' },
+    { k: 'unit', label: '计量单位', placeholder: '如：件 / 个 / 米 / 桶' },
+    isEdit
+      ? { k: 'opening', label: '期初库存', type: 'number', step: '0.01',
+          hint: '修改后按全部流水重算当前结存；调整实际库存请用「盘点」' }
+      : { k: 'quantity', label: '初始库存', type: 'number', step: '0.01',
+          hint: '建档时的期初数量，之后由出入库流水自动增减' },
+    { k: 'min_stock', label: '安全库存', type: 'number', step: '0.01', hint: '结存低于或等于该值时预警' },
+    { k: 'max_stock', label: '库存上限', type: 'number', step: '0.01' },
+    { k: 'unit_price', label: '参考单价（元）', type: 'number', step: '0.01' },
+    { k: 'location', label: '库位', placeholder: '如：A区-01' },
+    { k: 'supplier', label: '供应商' },
+    { k: 'status', label: '物料状态', type: 'select',
+      options: Object.keys(WH_ITEM_STATUS).map(k => ({ k, n: WH_ITEM_STATUS[k][0] })) },
+    { k: 'remark', label: '备注', type: 'textarea', full: true }
+  ];
+}
+
+function whForm(id) {
+  const i = id ? whAll().find(x => x.id === Number(id)) : null;
+  if (id && !i) return;
+  openForm({
+    title: id ? '编辑物料' : '新增物料',
+    sub: id ? `${i.code || ''} · 当前结存 ${num(i.quantity)} ${i.unit || ''}` : '建档后即可登记入库 / 出库 / 盘点',
+    values: i || { category: 'other', unit: '件', quantity: 0, min_stock: 0, unit_price: 0, status: 'normal' },
+    fields: whFields(!!id),
+    onSubmit: async (v) => {
+      if (id) await api('/warehouse_items/' + id, { method: 'PUT', body: v });
+      else await api('/warehouse_items', { method: 'POST', body: v });
+      toast(id ? '物料已更新' : '物料已建档');
+      await refresh(() => { if (id) openWhDetail(id); });
+    },
+    attach: id ? { entity: 'warehouse_items', id: Number(id) } : null
+  });
+}
+
+function whRecordFields() {
+  return [
+    { k: 'type', label: '流水类型', type: 'select', required: true,
+      options: Object.keys(WH_RECORD_TYPE).map(k => ({ k, n: WH_RECORD_TYPE[k][0] })),
+      hint: '盘点调整：数量填写「盘点后的实际结存」' },
+    { k: 'log_date', label: '日期', type: 'date', required: true },
+    { k: 'quantity', label: '数量 / 盘点结存', type: 'number', step: '0.01', required: true,
+      hint: '入库 / 出库填变动数量；盘点填实际结存；出库不得超过当前结存' },
+    { k: 'unit_price', label: '单价（元）', type: 'number', step: '0.01', hint: '留空则取物料参考单价' },
+    { k: 'person', label: '经办人' },
+    { k: 'purpose', label: '用途 / 关联事项', full: true, placeholder: '如：A栋二层灯具更换' },
+    { k: 'remark', label: '备注', type: 'textarea', full: true }
+  ];
+}
+
+function openWhRecordForm(itemId, type, recordId) {
+  const rec = recordId ? ((S.data.warehouse_records || []).find(x => x.id === Number(recordId))) : null;
+  if (recordId && !rec) return;
+  const iid = rec ? rec.item_id : Number(itemId);
+  const i = whAll().find(x => x.id === iid);
+  if (!i) return;
+  const tp = rec ? rec.type : (WH_RECORD_TYPE[type] ? type : 'in');
+  const isEdit = !!rec;
+  openForm({
+    title: isEdit ? '编辑出入库流水' : `${WH_RECORD_TYPE[tp][0]}登记`,
+    sub: `${i.name} · 当前结存 ${num(i.quantity)} ${i.unit || ''}`,
+    values: isEdit ? {
+      type: rec.type, log_date: rec.log_date || today(), quantity: rec.quantity,
+      unit_price: rec.unit_price, person: rec.person || '', purpose: rec.purpose || '', remark: rec.remark || ''
+    } : {
+      type: tp, log_date: today(), quantity: tp === 'adjust' ? i.quantity : '',
+      unit_price: i.unit_price, person: '', purpose: '', remark: ''
+    },
+    fields: whRecordFields(),
+    submitText: isEdit ? '保存修改' : '保存流水',
+    onSubmit: async (v) => {
+      if (isEdit) await api('/warehouse_records/' + rec.id, { method: 'PUT', body: v });
+      else await api('/warehouse_records', { method: 'POST', body: Object.assign({ item_id: iid }, v) });
+      toast(isEdit ? '流水已更新，结存已重算' : `${WH_RECORD_TYPE[tp][0]}成功`);
+      await refresh(() => openWhDetail(iid));
+    }
+  });
+}
+
+function deleteWhRecord(id) {
+  const rec = (S.data.warehouse_records || []).find(x => x.id === Number(id));
+  if (!rec) return;
+  confirmAsk('删除出入库流水',
+    `确定删除 ${esc((WH_RECORD_TYPE[rec.type] || ['记录'])[0])}（${esc(rec.log_date || '')}，数量 ${num(rec.quantity)}）？<br><br>物料结存与后续流水金额会自动重算，此操作不可恢复。`,
+    async () => {
+      await api('/warehouse_records/' + rec.id, { method: 'DELETE' });
+      toast('流水已删除，结存已重算');
+      await refresh(() => openWhDetail(rec.item_id));
+    });
+}
+
+function printWhItemHtml(id) {
+  const i = whAll().find(x => x.id === Number(id));
+  if (!i) return '';
+  const recs = whRecords(i.id);
+  const atts = attsOf('warehouse_items', i.id);
+  const body = `
+    <div class="kv">
+      <div><div class="k">物料编号</div><div class="v">${esc(i.code || '—')}</div></div>
+      <div><div class="k">分类 / 规格</div><div class="v">${esc(WH_CAT[i.category] || '其他')} · ${esc(i.spec || '—')}</div></div>
+      <div><div class="k">状态</div><div class="v">${esc((WH_ITEM_STATUS[i.status] || ['正常'])[0])}${whLowStock(i) ? ' · 低库存' : ''}</div></div>
+      <div><div class="k">当前结存</div><div class="v">${num(i.quantity)} ${esc(i.unit || '')}</div></div>
+      <div><div class="k">期初 / 安全库存</div><div class="v">${num(i.opening)} / ${num(i.min_stock)} ${esc(i.unit || '')}</div></div>
+      <div><div class="k">库存金额</div><div class="v">${money(whValue(i))}</div></div>
+      <div><div class="k">单价</div><div class="v">${money(i.unit_price)}</div></div>
+      <div><div class="k">库位</div><div class="v">${esc(i.location || '—')}</div></div>
+      <div><div class="k">供应商</div><div class="v">${esc(i.supplier || '—')}</div></div>
+    </div>
+    <div class="sect-title">出入库 / 盘点流水<span class="line"></span></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>日期</th><th>类型</th><th class="num">数量</th><th class="num">单价</th>
+        <th class="num">金额</th><th class="num">结存</th><th>经办 / 用途</th></tr></thead>
+      <tbody>${recs.length ? recs.map(r => `<tr><td>${esc(r.log_date || '')}</td>
+        <td>${esc((WH_RECORD_TYPE[r.type] || ['记录'])[0])}</td><td class="num">${num(r.quantity)}</td>
+        <td class="num">${money(r.unit_price)}</td><td class="num">${money(r.amount)}</td>
+        <td class="num"><b>${num(r.balance)}</b></td>
+        <td>${esc([r.person, r.purpose].filter(Boolean).join(' · ') || '—')}</td></tr>`).join('')
+        : `<tr><td colspan="7"><div class="empty">暂无出入库流水</div></td></tr>`}</tbody>
+    </table></div>
+    ${atts.length ? `<div class="sect-title">物料附件<span class="line"></span></div>${thumbsHtml('warehouse_items', i.id, 6)}` : ''}`;
+  return printRecordDoc({ docTitle: '物料库存卡', name: i.name, sub: i.code || '', body });
+}
+function printWhItem(id) {
+  const html = printWhItemHtml(id);
+  if (!html) { toast('物料不存在或已被删除', 'err'); return; }
+  printHtmlDoc(html);
+}
+
+/* ============================================================
+   系统设置
+   ============================================================ */
+const MODULE_VIEWS = [COCKPIT_VIEW, 'shops', 'equipments', 'contracts', 'payments', 'archives', 'warehouse'];
+/* 保存设置时只提交本页字段，避免页面上其它 [data-k] 元素（搜索框等）混入请求 */
+const SETTING_KEYS = [
+  'org_name', 'project_name', 'manager', 'phone', 'address',
+  'water_price', 'elec_price', 'pay_remind_days', 'maintain_remind_days',
+  'default_view', 'default_mode',
+  // 1.24.0：OnlyOffice 在线预览
+  'oo_enabled', 'oo_server', 'oo_jwt_secret', 'oo_public_url'
+];
+const OO_SETTING_KEYS = ['oo_enabled', 'oo_server', 'oo_jwt_secret', 'oo_public_url'];
+
+const bytesText = (n) => {
+  n = Number(n) || 0;
+  if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  return Math.max(1, Math.round(n / 1024)) + ' KB';
+};
+const durText = (sec) => {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+  if (d) return `${d} 天 ${h} 小时`;
+  if (h) return `${h} 小时 ${m} 分`;
+  return `${m} 分 ${sec % 60} 秒`;
+};
+
+function viewSettings() {
+  const s = S.settings || {};
+  const st = (S.data && S.data.meta && S.data.meta.store) || {};
+  const totalRows = ['shops', 'readings', 'bills', 'shop_progress_logs', 'equipments', 'equipment_logs',
+    'contracts', 'payment_plans', 'payments', 'progress_logs', 'archives', 'archive_logs',
+    'warehouse_items', 'warehouse_records', 'attachments']
+    .reduce((n, k) => n + ((S.data[k] || []).length), 0);
+  const lan = (S.data && S.data.meta && S.data.meta.lan) || {};
+  const lanUrls = Array.isArray(lan.urls) ? lan.urls : [];
+  const lanHtml = lan.enabled === false
+    ? '已关闭'
+    : (lanUrls.length
+      ? lanUrls.map(u => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>`).join('<br>')
+      : `端口 ${esc(String(lan.port || 3340))} · 未检测到内网地址`);
+
+  const infoFields = [
+    { k: 'org_name', label: '物业 / 公司名称', full: true, placeholder: '留空即可，填写后用于打印单据抬头', hint: '默认为空白，可由使用单位自行填写' },
+    { k: 'project_name', label: '项目名称', placeholder: '显示在侧边栏左上角', hint: '留空则显示「物业工程管理」' },
+    { k: 'manager', label: '项目负责人', placeholder: '如：张工' },
+    { k: 'phone', label: '联系电话', placeholder: '如：020-8888 6666' },
+    { k: 'address', label: '项目地址', full: true, placeholder: '如：广州市天河区…' }
+  ];
+  const feeFields = [
+    { k: 'water_price', label: '默认水费单价（元/吨）', type: 'number', step: '0.01', hint: '新增商铺时自动带入' },
+    { k: 'elec_price', label: '默认电费单价（元/度）', type: 'number', step: '0.01', hint: '新增商铺时自动带入' },
+    { k: 'pay_remind_days', label: '付款提前提醒（天）', type: 'number', step: '1', hint: '距应付日 N 天内自动置为待支付' },
+    { k: 'maintain_remind_days', label: '保养提前预警（天）', type: 'number', step: '1', hint: '设备距保养日 N 天内标记待保养' }
+  ];
+  const viewOptions = MODULE_VIEWS.map(k => ({ k, n: TITLES[k].title }));
+  /* 1.24.0：OnlyOffice 在线预览设置 */
+  const ooOn = s.oo_enabled === '1';
+  const ooFields = [
+    { k: 'oo_enabled', label: '启用 OnlyOffice', type: 'select', options: [{ k: '0', n: '关闭（仅内置预览）' }, { k: '1', n: '启用（Office 在线预览）' }], hint: '关闭时 Word / PPT 等附件仍按原方式下载查看' },
+    { k: 'oo_server', label: 'Document Server 地址', placeholder: '如 http://192.168.1.10:8080', hint: '填 ONLYOFFICE 文档服务器访问根地址，可直接写 IP:端口' },
+    { k: 'oo_jwt_secret', label: 'JWT 密钥（可选）', type: 'password', placeholder: s.oo_jwt_set ? '已配置，留空可清除' : 'DocServer 未启用 JWT 时留空', hint: '仅存服务端；显示 ****** 表示不修改，清空输入则清除密钥' },
+    { k: 'oo_public_url', label: '本应用对外地址（可选）', placeholder: '如 http://192.168.1.10:3340', hint: '留空自动按当前访问地址推导；DocServer 拉不到文件时手动填写' }
+  ];
+
+  return `
+  <div class="set-grid">
+    <div class="card set-card">
+      <div class="card-head"><h3>项目信息</h3><span class="sub">界面标识与单据抬头</span></div>
+      <div class="card-body"><div class="form-grid">${infoFields.map(f => fieldHtml(f, s[f.k])).join('')}</div></div>
+    </div>
+    <div class="card set-card">
+      <div class="card-head"><h3>计费与提醒</h3><span class="sub">默认单价与到期预警窗口</span></div>
+      <div class="card-body"><div class="form-grid">${feeFields.map(f => fieldHtml(f, s[f.k])).join('')}</div></div>
+    </div>
+  </div>
+
+  <div class="card set-card" style="margin-bottom:14px">
+    <div class="card-head"><h3>显示偏好</h3><span class="sub">首次打开时的默认模块与视图方式</span></div>
+    <div class="card-body">
+      <div class="form-grid">
+        ${fieldHtml({ k: 'default_view', label: '默认模块', type: 'select', options: viewOptions, hint: '每次登录固定进入「可视化驾驶舱」；本项用于刷新页面且无历史记忆时' }, s.default_view)}
+        ${fieldHtml({ k: 'default_mode', label: '默认显示模式', type: 'select', options: [{ k: 'list', n: '列表' }, { k: 'card', n: '方块' }], hint: '商铺 / 设备 / 合同首次展示方式' }, s.default_mode)}
+      </div>
+    </div>
+  </div>
+
+  <div class="set-grid" style="grid-template-columns:1fr">
+    <div class="card set-card" data-oo-card="1">
+      <div class="card-head"><h3>Office 在线预览（OnlyOffice）</h3><span class="sub">Word / Excel / PPT 由 Document Server 完整渲染</span></div>
+      <div class="card-body">
+        <div class="form-grid">${ooFields.map(f => fieldHtml(f, s[f.k])).join('')}</div>
+        <div class="oo-help">
+          <b>使用方法</b>：在 NAS 上安装并启动 ONLYOFFICE 文档服务器 → 把它的访问地址填到上面 → 点「测试连接」→ 把「启用 OnlyOffice」选为启用并点「保存设置」。之后附件里的 Word / PPT / 旧版 xls 会带「Office 预览」角标，点开即可在线查看（只读，不会改动原文件）。<br>
+          <b>连通要求</b>：Document Server 必须能主动访问本应用，用于拉取 <code>/api/onlyoffice/file/…</code> 原文件。若它运行在容器或另一台设备、无法识别当前访问域名，请填写「本应用对外地址」，填到端口即可，例如 <code>http://192.168.1.10:3340</code>。<br>
+          <b>支持格式</b>：doc / docx / rtf / odt、xls / xlsx / xlsm / csv、ppt / pptx / odp 等；PDF、图片与文本仍走内置预览。DocServer 7.2+ 默认开启 JWT，两边需填一致的密钥；关闭 JWT 的部署留空即可。
+        </div>
+        <div class="attach-actions" style="margin-top:12px">
+          <button class="btn btn-sm" data-act="testOoServer">测试连接</button>
+          <span class="oo-status" id="ooStatusHint">当前：${ooOn ? '已启用' : '未启用'}${s.oo_jwt_set ? ' · JWT 已配置' : ''}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="set-grid">
+    <div class="card set-card">
+      <div class="card-head"><h3>数据维护</h3><span class="sub">备份与导出</span></div>
+      <div class="card-body">
+        <div class="set-item">
+          <div><div class="si-k">备份全部数据</div><div class="si-s">JSON 快照，含全部台账、附件索引与设置</div></div>
+          <button class="btn btn-sm" data-act="backup">立即备份</button>
+        </div>
+        <div class="set-item">
+          <div><div class="si-k">导出全部台账</div><div class="si-s">7 个模块 / 18 张工作表的 Excel</div></div>
+          <button class="btn btn-sm" data-act="exportAll">导出 Excel</button>
+        </div>
+        <div class="set-item">
+          <div><div class="si-k">恢复默认设置</div><div class="si-s">仅重置本页参数，业务数据不受影响</div></div>
+          <button class="btn btn-sm" data-act="resetSettings">恢复默认</button>
+        </div>
+      </div>
+    </div>
+    <div class="card set-card">
+      <div class="card-head"><h3>存储状态</h3><span class="sub">数据保存在 NAS 本机</span></div>
+      <div class="card-body">
+        <div class="set-item">
+          <div><div class="si-k">数据引擎</div><div class="si-s">SQLite 嵌入式数据库，无外部依赖</div></div>
+          <div class="si-v">${st.engine === 'sqlite' ? 'SQLite' : st.engine === 'json' ? 'JSON 文件' : '—'}</div>
+        </div>
+        <div class="set-item">
+          <div><div class="si-k">数据文件</div><div class="si-s" style="word-break:break-all">${esc(st.file || '—')}</div></div>
+          <div class="si-v">${st.size ? (st.size / 1024).toFixed(0) + ' KB' : '—'}</div>
+        </div>
+        <div class="set-item">
+          <div><div class="si-k">记录总数</div><div class="si-s">含附件索引，不含附件文件本体</div></div>
+          <div class="si-v">${totalRows} 条</div>
+        </div>
+        <div class="set-item">
+          <div><div class="si-k">局域网访问</div><div class="si-s">同一内网的手机 / 平板 / 电脑直接打开，无需经过飞牛桌面</div></div>
+          <div class="si-v" style="text-align:right;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.9">${lanHtml}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="set-grid" style="grid-template-columns:1fr">
+    <div class="card set-card">
+      <div class="card-head"><h3>功能模块</h3><span class="sub">当前版本包含的工作台模块</span></div>
+      <div class="card-body"><div class="mod-list">${modListHtml()}</div></div>
+    </div>
+  </div>
+
+  <div class="set-save">
+    <span class="tip">修改后点击「保存设置」立即生效；提醒天数会影响可视化驾驶舱与项目付款台帐的预警结果</span>
+    <button class="btn" data-act="resetSettings" style="margin-left:auto">恢复默认</button>
+    <button class="btn btn-primary" data-act="saveSettings">保存设置</button>
+  </div>`;
+}
+
+/* ============================================================
+   关于
+   ============================================================ */
+function viewAbout() {
+  const app = (S.data && S.data.meta && S.data.meta.app) || {};
+  const ver = app.version || '1.4.0';
+  const build = app.build || '2026-11-06';
+  return `
+  <div class="about-hero">
+    <div class="about-logo">
+      <svg viewBox="0 0 24 24"><path d="M3 21h18M5 21V8l7-4.5L19 8v13M9.5 21v-6h5v6M9 10.5h.01M15 10.5h.01"/></svg>
+    </div>
+    <div>
+      <div class="about-name">物业工程管理 <span class="ver">v${esc(ver)}</span></div>
+      <div class="about-sub">商铺 · 设备 · 合同 · 付款一体化管理，运行于飞牛 fnOS</div>
+    </div>
+    <div class="about-meta">
+      <div>开发者 <b style="color:var(--ink-2)">无冰咖啡糖</b></div>
+      <div>构建日期 ${esc(build)}</div>
+    </div>
+  </div>
+  <div id="aboutBody"><div class="loading"><div class="spinner"></div>正在读取运行信息…</div></div>`;
+}
+
+async function loadAbout() {
+  const box = $('#aboutBody');
+  if (!box) return;
+  try {
+    const data = await api('/about');
+    if (!$('#aboutBody')) return;
+    S.about = data;
+    $('#aboutBody').innerHTML = aboutBodyHtml(data || {});
+  } catch (e) {
+    const el = $('#aboutBody');
+    if (el) el.innerHTML = `<div class="card"><div class="card-body"><div class="empty">运行信息读取失败：${esc(e.message)}</div></div></div>`;
+  }
+}
+
+function aboutBodyHtml(a) {
+  const app = a.app || {};
+  const run = a.runtime || {};
+  const st = a.store || {};
+  const counts = a.counts || {};
+  const atts = a.attachments || { count: 0, size: 0 };
+  const rawUser = (S.data && S.data.meta && S.data.meta.user) || '';
+  const userName = typeof rawUser === 'string' ? rawUser : (rawUser.username || rawUser.userid || '本地');
+
+  const kv = (k, v) => `<div><div class="k">${k}</div><div class="v">${v}</div></div>`;
+
+  const lanUrls = Array.isArray(run.lanUrls) ? run.lanUrls : [];
+  const lanCell = run.lanEnabled === false
+    ? '已关闭'
+    : (lanUrls.length
+      ? lanUrls.map(u => `<a href="${esc(u)}" target="_blank" rel="noopener" style="font-family:ui-monospace,Menlo,monospace;font-size:12px">${esc(u)}</a>`).join('<br>')
+      : `端口 ${esc(String(run.lanPort || 3340))} · 未检测到内网 IPv4`);
+
+  const dataRows = Object.keys(TBL_LABEL).map(k => `
+    <tr>
+      <td class="t-main">${TBL_LABEL[k]}</td>
+      <td class="t-sub">${k}</td>
+      <td class="num">${counts[k] || 0}</td>
+    </tr>`).join('');
+
+  const logs = CHANGELOG.map(v => `
+    <div class="log-item ${v.cur ? 'cur' : ''}">
+      <div class="log-v">v${esc(v.v)}<span class="log-d">${esc(v.d)}</span></div>
+      <ul class="log-t">${v.items.map(t => `<li>${esc(t)}</li>`).join('')}</ul>
+    </div>`).join('');
+
+  return `
+  <div class="set-grid">
+    <div class="card set-card">
+      <div class="card-head"><h3>运行环境</h3><span class="sub">当前服务实例</span></div>
+      <div class="card-body">
+        <div class="kv">
+          ${kv('应用版本', `v${esc(app.version || '—')} <span style="color:var(--faint)">(${esc(app.build || '')})</span>`)}
+          ${kv('Node 运行时', esc(run.node || '—'))}
+          ${kv('系统平台', esc(run.platform || '—'))}
+          ${kv('监听方式', `统一网关 <b>${esc(run.gateway || '')}</b>`)}
+          ${kv('局域网访问', lanCell)}
+          ${kv('已运行', esc(durText(run.uptime)))}
+          ${kv('内存占用', esc(bytesText(run.memory)))}
+          ${kv('数据引擎', engineText(st.engine))}
+          ${kv('数据文件大小', st.size ? esc(bytesText(st.size)) : '—')}
+          ${kv('启动时间', esc(String(run.startedAt || '').replace('T', ' ').slice(0, 19)))}
+          ${kv('当前用户', esc(userName || '本地'))}
+        </div>
+      </div>
+    </div>
+    <div class="card set-card">
+      <div class="card-head"><h3>数据规模</h3><span class="sub">共 ${a.total || 0} 条记录 · 附件 ${atts.count || 0} 个 / ${esc(bytesText(atts.size))}</span></div>
+      <div class="card-body" style="padding-top:4px">
+        <div class="table-wrap" style="border:none">
+          <table>
+            <thead><tr><th>数据表</th><th>标识</th><th class="num">记录数</th></tr></thead>
+            <tbody>${dataRows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="set-grid" style="grid-template-columns:1fr">
+    <div class="card set-card">
+      <div class="card-head"><h3>更新日志</h3><span class="sub">近期版本变化</span></div>
+      <div class="card-body"><div class="log">${logs}</div></div>
+    </div>
+  </div>
+
+  <div class="card set-card">
+    <div class="card-head"><h3>技术说明与支持</h3><span class="sub">私有部署，数据不出内网</span></div>
+    <div class="card-body">
+      <div class="kv">
+        ${kv('技术栈', 'Node.js 22 原生 HTTP 服务 + node:sqlite；前端原生 JS + ECharts（本地内置）')}
+        ${kv('依赖情况', '零 npm 依赖，随 fnOS 应用包整体安装')}
+        ${kv('数据位置', '<code>/var/apps/pmops/var/</code>（数据库、附件目录）')}
+        ${kv('数据备份', '设置 → 数据维护 → 立即备份；建议定期下载留存')}
+        ${kv('运行日志', '<code>/var/apps/pmops/var/app.log</code>')}
+        ${kv('使用许可', '私有部署工具，版权归开发者所有；未授权不得二次分发')}
+      </div>
+      <div style="margin-top:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-sm" data-act="backup">备份数据</button>
+        <button class="btn btn-sm" data-act="exportAll">导出全部台账</button>
+        <button class="btn btn-sm" data-act="nav" data-view="settings">前往系统设置</button>
+        <span style="margin-left:auto;font-size:11.5px;color:var(--faint)">© 2026 无冰咖啡糖 · 物业工程管理 · 飞牛 fnOS 应用</span>
+      </div>
+    </div>
+  </div>`;
+}
+
+function engineText(e) {
+  return e === 'sqlite' ? 'SQLite（WAL）' : e === 'json' ? 'JSON 文件' : '—';
+}
+
+/* ============================================================
+   弹窗拖动（1.14.0 引入 / 1.16.0 优化）
+   一层详情窗与二层预览窗都可按住标题栏 / 空白处移动：
+   · 指针捕获：指针移出弹窗甚至窗口边缘仍跟手，不会「拖丢」
+   · 冻结出场动画 + 逐帧节流：起拖不跳位，移动顺滑不抖动
+   · 拖动结束抑制紧随的 click，避免松手落在遮罩上把窗口误关
+   · 双击标题栏一键回正；位移始终保证标题栏留在可视范围
+   位移用 transform 实现，不改变遮罩层，遮罩点击关闭等行为不受影响。
+   ============================================================ */
+const MODAL_DRAG = {
+  box: null, id: null, sx: 0, sy: 0, ox: 0, oy: 0, bx: 0, by: 0,
+  bw: 620, bh: 420, px: 0, py: 0, moved: false, raf: 0, suppressClick: false
+};
+const DRAG_THRESHOLD = 3;
+const RAF = (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function')
+  ? window.requestAnimationFrame.bind(window) : null;
+const CAF = (typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function')
+  ? window.cancelAnimationFrame.bind(window) : null;
+
+function modalDragApply(box, x, y) {
+  if (!box) return '';
+  const tx = Math.round(Number(x) || 0), ty = Math.round(Number(y) || 0);
+  if (box.dataset) { box.dataset.dragX = String(tx); box.dataset.dragY = String(ty); }
+  if (box.style) box.style.transform = `translate(${tx}px, ${ty}px)`;
+  if (box.classList && box.classList.add) box.classList.add('dragging');
+  return `translate(${tx}px, ${ty}px)`;
+}
+
+/** 拖动样式集中开关：CSS pop 动画会覆盖 inline transform，必须先冻结 */
+function dragActive(on) {
+  const box = MODAL_DRAG.box;
+  if (box) {
+    if (on && box.style) box.style.animation = 'none'; // 不还原，避免松手后重播出场动画
+    if (box.classList && box.classList.add && box.classList.remove) {
+      box.classList[on ? 'add' : 'remove']('dragging');
+      box.classList[on ? 'add' : 'remove']('drag-ready');
+    }
+  }
+  const body = (typeof document !== 'undefined' && document.body) || null;
+  if (body && body.classList && body.classList.add && body.classList.remove) {
+    body.classList[on ? 'add' : 'remove']('modal-dragging');
+  }
+}
+
+/** 关闭 / 回退弹窗时清掉拖动位移，避免下次打开仍停在旧位置 */
+function resetModalDrag(box) {
+  const el = typeof box === 'string' ? $(box) : box;
+  let target = el;
+  if (el && typeof el.querySelector === 'function') target = el.querySelector('.modal') || el;
+  if (!target || !target.style) return;
+  target.style.transform = '';
+  target.style.animation = '';
+  if (target.dataset) { delete target.dataset.dragX; delete target.dataset.dragY; }
+  if (target.classList && target.classList.remove) {
+    target.classList.remove('dragging');
+    target.classList.remove('drag-ready');
+  }
+}
+
+/** 允许起拖的区域：标题栏整条、页脚空白、内容区空白；交互元素与正文文本一律排除 */
+function modalDragTarget(t) {
+  if (!t || typeof t.closest !== 'function') return null;
+  if (t.closest('[data-no-drag]') || t.closest('button, a, input, select, textarea, label, .modal-close')) return null;
+  const head = t.closest('.modal-head');
+  const foot = t.closest('.modal-foot');
+  const body = t.closest('.modal-body');
+  if (!head && !foot && !body) return null;
+  if (!head && !foot && body) {
+    // 只认容器自身与空白装饰块，表格文字、图片、表单卡片不再误触发拖动
+    if (t.closest('p, li, td, th, pre, code, img, video, table, .kv, .field, .card, .att')) return null;
+    const cls = String(t.className || '');
+    if (t !== body && !/(^|\s)(sect-title|empty|thumbs-none|attach-empty)(\s|$)/.test(cls)) return null;
+  }
+  return t.closest('.modal');
+}
+
+function beginModalDrag(box, x, y, pointerId) {
+  if (!box) return false;
+  const bx = Number((box.dataset || {}).dragX || 0), by = Number((box.dataset || {}).dragY || 0);
+  const rect = typeof box.getBoundingClientRect === 'function' ? box.getBoundingClientRect() : null;
+  const r = rect || { left: 0, top: 0 };
+  // 出场动画的 transform 会污染位置基准，起拖即冻结，避免第一次移动「跳一下」
+  if (box.style) box.style.animation = 'none';
+  Object.assign(MODAL_DRAG, {
+    box, id: pointerId == null ? null : pointerId,
+    sx: Number(x) || 0, sy: Number(y) || 0,
+    px: Number(x) || 0, py: Number(y) || 0,
+    ox: (Number(r.left) || 0) - bx, oy: (Number(r.top) || 0) - by,
+    bw: Number(r.width) > 0 ? Number(r.width) : 620,
+    bh: Number(r.height) > 0 ? Number(r.height) : 420,
+    bx, by, moved: false, raf: 0
+  });
+  return true;
+}
+
+/** 位移限制在「标题栏始终可见」范围内，允许弹窗部分移出左右与下方 */
+function dragClamp(tx, ty) {
+  const d = MODAL_DRAG;
+  const w = (typeof window !== 'undefined' && window.innerWidth) || 0;
+  const h = (typeof window !== 'undefined' && window.innerHeight) || 0;
+  if (!w || !h) return [tx, ty];
+  const keepX = Math.min(d.bw, 160), keepY = 44;
+  const loX = -(d.bw - keepX) - d.ox, hiX = w - keepX - d.ox;
+  const loY = 8 - d.oy, hiY = h - keepY - d.oy;
+  return [
+    clamp(tx, Math.min(loX, hiX), Math.max(loX, hiX)),
+    clamp(ty, Math.min(loY, hiY), Math.max(loY, hiY))
+  ];
+}
+
+function dragFlush() {
+  const d = MODAL_DRAG;
+  d.raf = 0;
+  if (!d.box) return null;
+  const dx = d.px - d.sx, dy = d.py - d.sy;
+  if (!d.moved && Math.abs(dx) + Math.abs(dy) < DRAG_THRESHOLD) return null; // 小于 3px 视为普通点击
+  if (!d.moved) { d.moved = true; dragActive(true); }
+  const [tx, ty] = dragClamp(d.bx + dx, d.by + dy);
+  return modalDragApply(d.box, tx, ty);
+}
+
+function moveModalDrag(x, y) {
+  const d = MODAL_DRAG;
+  if (!d.box) return null;
+  d.px = Number(x) || 0; d.py = Number(y) || 0;
+  if (d.raf) return null;
+  if (RAF) { d.raf = RAF(dragFlush); return null; }
+  return dragFlush(); // 无 RAF 的环境（桩测试）同步返回位移字符串
+}
+
+function endModalDrag(e) {
+  const d = MODAL_DRAG;
+  if (d.raf) { if (CAF) CAF(d.raf); d.raf = 0; }
+  const box = d.box, pid = d.id, moved = d.moved;
+  dragActive(false);
+  // 真实指针松开时，紧随其后的 click 不应落到遮罩上把窗口误关
+  if (moved && e && e.type) {
+    d.suppressClick = true;
+    setTimeout(() => { MODAL_DRAG.suppressClick = false; }, 300);
+  }
+  d.box = null; d.id = null; d.moved = false;
+  if (box && pid != null && typeof box.releasePointerCapture === 'function') {
+    try { box.releasePointerCapture(pid); } catch (err) {}
+  }
+}
+
+/** 拖动后的那一次 click 直接吞掉；超时自动解除，不影响后续操作 */
+function dragSuppressClick() {
+  if (!MODAL_DRAG.suppressClick) return false;
+  MODAL_DRAG.suppressClick = false;
+  return true;
+}
+
+function captureDrag(box, pid) {
+  if (pid == null || !box || typeof box.setPointerCapture !== 'function') return;
+  try { box.setPointerCapture(pid); } catch (e) {}
+}
+
+function installModalDrag() {
+  if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+  const pointer = typeof window !== 'undefined' && !!window.PointerEvent;
+  const down = pointer ? 'pointerdown' : 'mousedown';
+  const move = pointer ? 'pointermove' : 'mousemove';
+  const up = pointer ? 'pointerup' : 'mouseup';
+  document.addEventListener(down, (e) => {
+    if (!e || (e.button != null && e.button !== 0)) return;
+    // 1.25.0：手机端触摸不拖动弹窗，避免与页面滚动 / 输入抢手势
+    if (!dragEventAllowed(e)) return;
+    if (MODAL_DRAG.box) endModalDrag();
+    const box = modalDragTarget(e.target);
+    if (!box) return;
+    const pid = pointer && e.pointerId != null ? e.pointerId : null;
+    beginModalDrag(box, e.clientX || 0, e.clientY || 0, pid);
+    captureDrag(box, pid);
+  });
+  document.addEventListener(move, (e) => {
+    if (!MODAL_DRAG.box) return;
+    if (e.pointerId != null && MODAL_DRAG.id != null && e.pointerId !== MODAL_DRAG.id) return;
+    if (MODAL_DRAG.moved && typeof e.preventDefault === 'function') e.preventDefault();
+    moveModalDrag(e.clientX || 0, e.clientY || 0);
+  });
+  document.addEventListener(up, (e) => { if (MODAL_DRAG.box) endModalDrag(e); });
+  if (pointer) {
+    document.addEventListener('pointercancel', (e) => { if (MODAL_DRAG.box) endModalDrag(e); });
+    document.addEventListener('lostpointercapture', (e) => { if (MODAL_DRAG.box) endModalDrag(e); });
+  } else if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('blur', () => { if (MODAL_DRAG.box) endModalDrag(); });
+  }
+  // 拖动中禁止浏览器原生图片 / 链接拖拽
+  document.addEventListener('dragstart', (e) => {
+    if (MODAL_DRAG.box && typeof e.preventDefault === 'function') e.preventDefault();
+  });
+  // 双击标题栏 → 位置回正
+  document.addEventListener('dblclick', (e) => {
+    if (!e || !e.target || typeof e.target.closest !== 'function') return;
+    if (!e.target.closest('.modal-head') || e.target.closest('button, a, .modal-close')) return;
+    const box = e.target.closest('.modal');
+    if (box) resetModalDrag(box);
+  });
+}
+installModalDrag();
+
+/* ============================================================
+   1.20.0：弹窗关闭规则
+   ① 只有「关闭 / 取消」按钮或右上角 × 才能关闭弹窗；
+      点击弹窗外空白（遮罩）、按 ESC、拖动 / 框选一律不关闭；
+   ② 一次只关一层：二层预览 → 一层弹窗 → 回退目标 → 完全关闭。
+   ============================================================ */
+/** 判定点击是否落在遮罩「本身」；仅用于吞掉空白处点击，不再触发任何关闭 */
+function overlayKindOf(node) {
+  if (!node || typeof node.closest !== 'function') return '';
+  const light = node.closest('.light-overlay');
+  if (light && node === light) return 'light';
+  const modal = node.closest('.overlay');
+  if (modal && node === modal) return 'modal';
+  return '';
+}
+let OVERLAY_PRESS = '';
+/** 兼容保留：记录按下落点，1.20.0 起不再据此关闭弹窗 */
+function rememberOverlayPress(e) {
+  OVERLAY_PRESS = overlayKindOf(e && e.target);
+}
+/** 表单弹窗初始值快照（表单逻辑仍在使用；不再用于拦截关闭） */
+function modalFormSignature() {
+  const form = $('.modal-body form');
+  if (!form || typeof form.querySelectorAll !== 'function') return null;
+  const els = form.querySelectorAll('[data-k]');
+  let sig = '';
+  for (const el of els) sig += String(el.value == null ? '' : el.value) + '\u0001';
+  return sig;
+}
+function modalHasUnsaved() {
+  if (!S.modalSnapshot) return false;
+  const cur = modalFormSignature();
+  return cur !== null && cur !== S.modalSnapshot;
+}
+/** 遮罩空白处的点击只吞掉事件，绝不关闭任何一层弹窗 */
+function handleOverlayClick(e) {
+  const kind = overlayKindOf(e && e.target);
+  OVERLAY_PRESS = '';
+  if (!kind) return false;
+  return true;
+}
+
+/* ============================================================
+   弹窗 / 表单
+   ============================================================ */
+function openModal(opt) {
+  closeNav();     // 1.25.0：弹窗优先，先收起移动端抽屉
+  endModalDrag(); // 换掉当前弹窗前先收尾，避免拖动状态指向已移除的节点
+  S.modalSnapshot = null;
+  const size = opt.size ? ' ' + opt.size : '';
+  // 弹窗回退：在新弹窗替换当前内容前，记住旧弹窗（如详情页），关闭新弹窗时退回旧内容
+  // keepReturn=true 用于编辑器重绘自身，不覆盖上一层回退目标
+  const prev = $('#modalRoot').innerHTML;
+  if (!opt.keepReturn) S.modalReturn = prev.trim() ? { html: prev, submit: S.formSubmit } : null;
+  $('#modalRoot').innerHTML = `
+    <div class="overlay">
+      <div class="modal${size}">
+        <div class="modal-head drag-handle">
+          <div><h3>${esc(opt.title || '')}</h3><div class="sub">${opt.sub ? esc(opt.sub) + ' · ' : ''}<span class="drag-hint">按住标题栏可拖动 · 双击回正 · 请点右上角 × 关闭</span><span class="tap-hint">请点右上角 × 关闭</span></div></div>
+          <button class="modal-close" data-act="closeModal"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+        </div>
+        <div class="modal-body">${opt.body || ''}</div>
+        ${opt.footer ? `<div class="modal-foot">${opt.footer}</div>` : ''}
+      </div>
+    </div>`;
+  document.body.style.overflow = 'hidden';
+}
+
+function closeModal() {
+  // 1.20.0：严格逐层——二层预览还开着时，任何关闭请求都先只收二层
+  if ($('#lightRoot').innerHTML) { closeLightbox(); return; }
+  S.modalSnapshot = null;
+  const mr = S.modalReturn;
+  S.modalReturn = null;
+  S.formSubmit = null;
+  // 有回退目标（如从详情页进入的编辑表单）→ 关闭时退回上一层弹窗
+  if (mr && mr.html) {
+    $('#modalRoot').innerHTML = mr.html;
+    // 回退到上一层的表单时，恢复其提交函数（否则保存按钮会失效）
+    S.formSubmit = mr.submit || null;
+    resetModalDrag('#modalRoot');
+    document.body.style.overflow = 'hidden';
+    return;
+  }
+  $('#modalRoot').innerHTML = '';
+  resetModalDrag('#modalRoot');
+  endModalDrag();
+  document.body.style.overflow = '';
+}
+
+function fieldHtml(f, v) {
+  const val = v == null ? '' : v;
+  const full = f.full ? ' full' : '';
+  const req = f.required ? '<i>*</i>' : '';
+  if (f.type === 'select') {
+    const opts = (f.options || []).map(o =>
+      `<option value="${esc(o.k)}" ${String(o.k) === String(val) ? 'selected' : ''}>${esc(o.n)}</option>`).join('');
+    return `<label class="field${full}"><span>${esc(f.label)}${req}</span>
+      <select data-k="${f.k}"><option value="">请选择</option>${opts}</select>
+      ${f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ''}</label>`;
+  }
+  if (f.type === 'textarea') {
+    return `<label class="field${full}"><span>${esc(f.label)}${req}</span>
+      <textarea data-k="${f.k}" placeholder="${esc(f.placeholder || '')}">${esc(val)}</textarea></label>`;
+  }
+  return `<label class="field${full}"><span>${esc(f.label)}${req}</span>
+    <input data-k="${f.k}" type="${f.type || 'text'}" value="${esc(val)}"
+      ${f.step ? `step="${f.step}"` : ''} placeholder="${esc(f.placeholder || '')}">
+    ${f.hint ? `<span class="hint"${f.hintId ? ` id="${f.hintId}"` : ''}>${esc(f.hint)}</span>` : ''}</label>`;
+}
+
+function openForm(opt) {
+  const fields = opt.fields;
+  const values = opt.values || {};
+  const body = `<form class="form-grid" onsubmit="return false">${fields.map(f => fieldHtml(f, values[f.k])).join('')}${opt.extra || ''}</form>`
+    + (opt.attach ? attachPanelHtml(opt.attach.entity, opt.attach.id) : '');
+  openModal({
+    title: opt.title,
+    sub: opt.sub,
+    body,
+    size: opt.size || 'md',
+    footer: `<button class="btn" data-act="closeModal">取消</button>
+             <button class="btn btn-primary" data-act="submitForm">${esc(opt.submitText || '保存')}</button>`
+  });
+  // 记录表单初始值快照；1.20.0 起关闭只认「关闭 / 取消」按钮与 ×，不再据快照拦截
+  S.modalSnapshot = modalFormSignature();
+  S.formSubmit = async () => {
+    const form = $('.modal-body form');
+    const data = {};
+    let missing = '';
+    fields.forEach(f => {
+      const el = form.querySelector(`[data-k="${f.k}"]`);
+      if (!el) return;
+      const v = (el.value || '').trim();
+      if (f.required && !v && !missing) missing = f.label;
+      data[f.k] = v;
+    });
+    if (missing) { toast('请填写：' + missing, 'err'); return; }
+    const btn = $('[data-act="submitForm"]');
+    const old = btn.textContent;
+    btn.disabled = true; btn.textContent = '处理中…';
+    const htmlBefore = $('#modalRoot').innerHTML;
+    try {
+      await opt.onSubmit(data);
+      // 保存成功：不回退到旧弹窗；若处理器自己重开了详情（内容已变化）则保持详情
+      S.modalReturn = null;
+      if ($('#modalRoot').innerHTML === htmlBefore) closeModal();
+    } catch (e) {
+      toast(e.message, 'err');
+      btn.disabled = false; btn.textContent = old;
+    }
+  };
+  // 表单渲染完成回调：用于字段联动（如金额 ↔ 比例自动计算）
+  if (opt.onMounted) {
+    const form = $('.modal-body form');
+    if (form) opt.onMounted(form);
+  }
+}
+
+/* ============================================================
+   业务操作
+   ============================================================ */
+function confirmAsk(title, text, onOk, okText, danger) {
+  openModal({
+    title, size: 'sm',
+    body: `<div style="font-size:13.5px;color:var(--ink-2);line-height:1.7">${text}</div>`,
+    footer: `<button class="btn" data-act="closeModal">取消</button>
+             <button class="btn ${danger === false ? 'btn-primary' : 'btn-danger'}" data-act="confirmOk">${esc(okText || '确认删除')}</button>`
+  });
+  S.formSubmit = async () => { await onOk(); };
+}
+
+/* ---------------- 1.23.0：附件数据同步 ---------------- */
+/** 当前附件快照签名：任何来源（上传 / 删除 / 整包刷新 / 另一个页面）的变化都能检测 */
+function attachSignature() {
+  return ((S.data && S.data.attachments) || [])
+    .map(a => `${a.id}:${a.name}`).sort().join('|');
+}
+/** 用服务端最新列表整体替换某条记录的附件缓存 */
+function applyAttachments(entity, eid, rows) {
+  if (!S.data || !Array.isArray(rows)) return;
+  const keep = (S.data.attachments || []).filter(a =>
+    !(a.entity === entity && Number(a.entity_id) === Number(eid)));
+  const next = rows.slice().sort((a, b) => Number(a.id) - Number(b.id));
+  S.data.attachments = keep.concat(next).sort((a, b) => Number(a.id) - Number(b.id));
+}
+/** 上传成功时先并入单条，不必等整包 bootstrap 就能看到新附件 */
+function mergeAttachmentRow(row) {
+  if (!row || !S.data) return;
+  const list = S.data.attachments || (S.data.attachments = []);
+  const i = list.findIndex(x => Number(x.id) === Number(row.id));
+  if (i >= 0) list[i] = row; else list.push(row);
+}
+/** 从服务端拉取该记录最新附件列表（跨页面 / 多标签同步） */
+async function fetchAttachments(entity, eid) {
+  try {
+    const rows = await api(`/attachments?entity=${encodeURIComponent(entity)}&id=${eid}`);
+    if (Array.isArray(rows)) { applyAttachments(entity, eid, rows); return true; }
+  } catch (e) {}
+  return false;
+}
+/** 详情弹窗的缩略图条 / 空态占位原地同步 */
+function rerenderAttGalleries() {
+  $$('.att-gallery').forEach(box => {
+    const entity = box.dataset.entity, id = Number(box.dataset.id) || 0;
+    if (!entity) return;
+    box.outerHTML = attGalleryHtml(entity, id, Number(box.dataset.max) || 3, box.dataset.empty || '');
+  });
+}
+/** 二层附件总览的计数原地同步 */
+function syncAttListHeader() {
+  $$('[data-att-count]').forEach(el => {
+    const parts = String(el.dataset.attCount || '').split(':');
+    const entity = parts[0], id = Number(parts[1]) || 0;
+    if (!entity) return;
+    el.innerHTML = `共 ${attsOf(entity, id).length} 个附件`;
+  });
+}
+/** 刷新弹窗内的附件面板：保留打开时的渲染配置，避免上传后标题 / 空态 / 只读状态被改掉 */
+function rerenderAttachPanels() {
+  $$('.attach-panel').forEach(box => {
+    const entity = box.dataset.entity;
+    const eid = Number(box.dataset.eid) || 0;
+    if (!entity) return;
+    const opt = {
+      title: box.dataset.title === '0' ? false : true,
+      empty: box.dataset.empty || undefined,
+      readonly: box.dataset.readonly === '1'
+    };
+    box.outerHTML = attachPanelHtml(entity, eid, opt);
+  });
+}
+/** 同步所有附件相关 DOM：只做局部替换，不重建弹窗（保留拖动位置与逐层结构） */
+function syncAttachUI() {
+  rerenderAttachPanels();
+  rerenderAttGalleries();
+  syncAttListHeader();
+}
+/** 上传 / 删除后全链路同步：服务端校正 → 主视图 → 详情弹窗 → 二层附件总览 */
+async function syncAttachData(entity, eid) {
+  syncAttachUI();                    // 先用本地已合并的数据即时反馈
+  await fetchAttachments(entity, eid); // 以服务端为准校正
+  syncAttachUI();
+  await refresh();                   // 列表附件数 / 档案统计栏 / 驾驶舱
+  syncAttachUI();                    // 主视图重绘后再次确保弹窗一致
+}
+
+/* ---------------- 附件操作 ---------------- */
+async function uploadAttachments(entity, eid, files, inputEl) {
+  const list = Array.from(files || []);
+  if (!list.length || !eid) return;
+  let ok = 0, fail = 0;
+  for (const f of list) {
+    // 1.19.0：档案附件（含 CAD 图纸）不限制大小，其余模块仍按 25MB 限制
+    if (entity !== 'archives' && f.size > MAX_UPLOAD_MB * 1024 * 1024) {
+      toast(`${f.name} 超过 ${MAX_UPLOAD_MB}MB`, 'err'); fail++; continue;
+    }
+    try {
+      const res = await fetch(
+        `${API_BASE}/attachments?entity=${encodeURIComponent(entity)}&id=${eid}&name=${encodeURIComponent(f.name)}`,
+        { method: 'POST', headers: { 'Content-Type': f.type || 'application/octet-stream' }, body: f }
+      );
+      let j = null;
+      try { j = await res.json(); } catch (e) {}
+      if (!res.ok || !j || j.ok === false) throw new Error((j && j.error) || ('HTTP ' + res.status));
+      ok++;
+      // 1.23.0：每个文件成功后立刻并入本地并刷新弹窗，不再等整包 bootstrap
+      if (j && j.data) mergeAttachmentRow(j.data);
+      syncAttachUI();
+    } catch (e) {
+      fail++;
+      toast(`${f.name} 上传失败：${e.message}`, 'err');
+    }
+  }
+  if (inputEl) inputEl.value = '';
+  if (ok) {
+    toast(fail ? `已上传 ${ok} 个，${fail} 个失败` : `已上传 ${ok} 个附件`);
+    await syncAttachData(entity, eid);
+  }
+}
+
+/* ---------- 1.24.0：OnlyOffice DocEditor 生命周期 ---------- */
+/** 换窗 / 关窗时销毁编辑器，避免 iframe 与会话残留 */
+function destroyOoEditor() {
+  const ed = S.ooEditor;
+  S.ooEditor = null;
+  if (ed && typeof ed.destroyEditor === 'function') {
+    try { ed.destroyEditor(); } catch (e) { /* 文档服务已断开时忽略 */ }
+  }
+}
+
+/** 按需加载 DocServer 的 api.js；同一地址复用，已挂上 DocsAPI 时直接复用 */
+function loadOoScript(src) {
+  if (window.DocsAPI && window.DocsAPI.DocEditor && (!S.ooScriptUrl || S.ooScriptUrl === src)) {
+    S.ooScriptUrl = src;
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const old = document.querySelector('script[data-oo-api="1"]');
+    if (old && old.parentNode && old.parentNode.removeChild) old.parentNode.removeChild(old);
+    const s = document.createElement('script');
+    s.type = 'text/javascript';
+    s.src = src;
+    s.setAttribute('data-oo-api', '1');
+    s.onload = () => { S.ooScriptUrl = src; resolve(); };
+    s.onerror = () => reject(new Error('无法加载 Document Server 的 api.js'));
+    (document.head || document.body || document).appendChild(s);
+  });
+}
+
+/** 二层弹窗：附件预览等，覆盖在详情弹窗之上；关闭只收掉本层 */
+function openLightbox(opt) {
+  closeNav();     // 1.25.0：二层预览同样先收起抽屉
+  destroyOoEditor();
+  const size = opt.size ? ' ' + opt.size : '';
+  $('#lightRoot').innerHTML = `
+    <div class="light-overlay">
+      <div class="modal${size}">
+        <div class="modal-head drag-handle">
+          <div><h3>${esc(opt.title || '')}</h3><div class="sub">${opt.sub ? esc(opt.sub) + ' · ' : ''}<span class="drag-hint">按住标题栏可拖动 · 双击回正 · 请点右上角 × 关闭</span><span class="tap-hint">请点右上角 × 关闭</span></div></div>
+          <button class="modal-close" data-act="closeLight"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+        </div>
+        <div class="modal-body">${opt.body || ''}</div>
+        ${opt.footer ? `<div class="modal-foot">${opt.footer}</div>` : ''}
+      </div>
+    </div>`;
+}
+
+function closeLightbox() {
+  // 1.24.0：先收掉 OnlyOffice 编辑器，再按原有逐层规则回退
+  destroyOoEditor();
+  // 1.22.0：严格逐层 —— 从附件总览点开的预览，关闭时先回到附件总览
+  const back = S.lightReturn;
+  const sig = S.lightReturnSig;
+  S.lightReturn = null;
+  S.lightReturnSig = '';
+  if (back) {
+    // 1.23.0：预览期间附件发生上传 / 删除时，用最新数据重建总览，避免回到过期列表
+    const m = back.match(/data-att-list="1"\s+data-entity="([^"]+)"\s+data-id="(\d+)"/);
+    if (m && sig !== attachSignature()) {
+      openAttList(m[1], Number(m[2]));
+      resetModalDrag('#lightRoot');
+      endModalDrag();
+      return;
+    }
+    $('#lightRoot').innerHTML = back;
+    resetModalDrag('#lightRoot');
+    endModalDrag();
+    return;
+  }
+  $('#lightRoot').innerHTML = '';
+  resetModalDrag('#lightRoot');
+  endModalDrag();
+}
+
+/** 1.22.0：把服务端返回的 sheets 渲染成可切换的 HTML 表格（附件与导出预览共用） */
+function attTableHtml(data) {
+  const sheets = (data && data.sheets) || [];
+  if (!sheets.length) return '<div class="att-pv-empty">没有可预览的表格内容</div>';
+  const tabs = sheets.length > 1
+    ? `<div class="att-pv-tabs">${sheets.map((s, i) =>
+      `<button class="att-pv-tab${i === 0 ? ' on' : ''}" data-act="attSheet" data-k="${i}">${esc(s.name || ('工作表 ' + (i + 1)))}</button>`).join('')}</div>`
+    : '';
+  const panels = sheets.map((s, i) => {
+    const hasCols = !!(s.columns && s.columns.length);
+    const cols = hasCols ? s.columns : ((s.rows && s.rows[0]) || []);
+    const body = hasCols ? (s.rows || []) : (s.rows || []).slice(1);
+    const head = cols.length
+      ? `<thead><tr>${cols.map(c => `<th>${esc(String(c == null ? '' : c))}</th>`).join('')}</tr></thead>` : '';
+    const rows = body.map(r => `<tr>${cols.map((_, ci) => `<td>${esc(String(r && r[ci] != null ? r[ci] : ''))}</td>`).join('')}</tr>`).join('');
+    return `<div class="att-sheet" data-sheet="${i}"${i === 0 ? '' : ' hidden'}>
+      <div class="att-pv-scroll"><table class="att-pv-table">${head}<tbody>${rows || `<tr><td colspan="${Math.max(1, cols.length)}" style="text-align:center;color:var(--faint)">暂无数据行</td></tr>`}</tbody></table></div>
+      <div class="att-pv-note">显示 ${body.length} 行${s.totalRows ? ' / 原始 ' + s.totalRows + ' 行' : ''}${s.truncated ? ' · 仅预览前 200 行，完整内容请下载原文件' : ''}${cols.length ? ' · ' + cols.length + ' 列' : ''}</div>
+    </div>`;
+  }).join('');
+  return tabs + panels;
+}
+
+/** 切换工作表：只改显示状态，不重绘弹窗（保留拖动位置与逐层结构） */
+function switchAttSheet(idx) {
+  const i = Number(idx) || 0;
+  $$('#lightRoot .att-sheet').forEach(el => {
+    if (Number(el.dataset.sheet) === i) el.removeAttribute('hidden');
+    else el.setAttribute('hidden', '');
+  });
+  $$('#lightRoot .att-pv-tab').forEach(el => {
+    if (el.classList) el.classList.toggle('on', Number(el.dataset.k) === i);
+  });
+}
+
+/** 预览窗的统一标题 / 尺寸 / 底部按钮 */
+function attPreviewBase(a, kind) {
+  const wide = kind === 'pdf' || kind === 'table' || kind === 'text' || kind === 'xls' || kind === 'office';
+  // 1.24.0：内置预览可一键切到 OnlyOffice 看完整版式，Office 预览可切回内置表格
+  const bk = attBuiltinKind(a);
+  const canBack = bk === 'table' || bk === 'text' || bk === 'pdf';
+  const switchBtn = kind === 'office'
+    ? (canBack ? `<button class="btn" data-act="builtinPreview" data-id="${a.id}">返回内置预览</button>` : '')
+    : (ooSupports(a) ? `<button class="btn" data-act="officePreview" data-id="${a.id}">用 OnlyOffice 打开</button>` : '');
+  return {
+    title: a.name,
+    sub: `${sizeText(a.size)}${a.created_at ? ' · ' + String(a.created_at).slice(0, 10) : ''}${a.uploader ? ' · ' + a.uploader : ''}${kind === 'office' ? ' · OnlyOffice 只读预览' : ''}`,
+    size: wide ? 'xxl' : 'lg',
+    footer: `${kind === 'pdf' ? `<a class="btn" href="${attUrl(a)}" target="_blank" rel="noopener">新窗口打开</a>` : ''}
+             ${switchBtn}
+             <button class="btn" data-act="closeLight">关闭</button>
+             <a class="btn btn-primary" href="${attUrl(a, true)}" download="${esc(a.name)}">下载原文件</a>`
+  };
+}
+
+/** 1.22.0：点击附件直接预览；1.24.0：Office 文档交给 OnlyOffice，可与内置预览互相切换 */
+async function openAttPreview(id, mode) {
+  const a = (S.data.attachments || []).find(x => x.id === Number(id));
+  if (!a) return;
+  const auto = attPreviewKind(a);
+  const kind = mode === 'office' ? (ooSupports(a) ? 'office' : auto)
+    : mode === 'builtin' ? attBuiltinKind(a)
+      : auto;
+  const base = attPreviewBase(a, kind);
+  // 1.20.0 严格逐层；1.24.0 预览窗之间互相切换时保留已记住的附件总览，不丢回退层级
+  const cur = $('#lightRoot').innerHTML;
+  const inPreview = /data-att-preview="1"/.test(cur) || /data-oo-preview="1"/.test(cur);
+  if (/data-att-list="1"/.test(cur) && !inPreview) {
+    S.lightReturn = cur;
+    S.lightReturnSig = attachSignature();
+  } else if (!inPreview) {
+    S.lightReturn = null;
+    S.lightReturnSig = '';
+  }
+
+  if (kind === 'office') { await openOfficePreview(a, base); return; }
+  if (kind === 'pdf') {
+    openLightbox(Object.assign({}, base, {
+      body: `<div data-att-preview="1">
+        <iframe class="att-pv-frame" src="${attUrl(a)}" title="${esc(a.name)}"></iframe>
+        <div class="att-pv-note">PDF 已在线加载；若浏览器未显示内容，可点「新窗口打开」或「下载原文件」。</div>
+      </div>`
+    }));
+    return;
+  }
+  if (kind === 'image') {
+    openLightbox(Object.assign({}, base, {
+      body: `<div data-att-preview="1"><div style="text-align:center;background:#f8fafc;border-radius:10px;padding:10px">
+         <img src="${attUrl(a)}" alt="${esc(a.name)}" style="max-width:100%;max-height:62vh;border-radius:6px">
+       </div></div>`
+    }));
+    return;
+  }
+  if (kind === 'table' || kind === 'text' || kind === 'xls') {
+    openLightbox(Object.assign({}, base, {
+      body: `<div data-att-preview="1"><div class="att-pv-empty">正在读取 ${esc(extOf(a.name))} 内容…</div></div>`
+    }));
+    try {
+      const data = await api('/attachments/' + a.id + '/preview');
+      let inner;
+      if (data.kind === 'table') inner = attTableHtml(data);
+      else if (data.kind === 'text') inner = `<div class="att-pv-scroll"><pre class="att-pv-pre">${esc(data.text || '')}</pre></div>`;
+      else inner = `<div class="att-pv-empty">
+          <div class="att-thumb" style="width:88px;height:88px;margin:0 auto 12px;border:1px solid var(--line);border-radius:10px"><span class="ext">${esc(extOf(a.name))}</span></div>
+          ${esc(data.reason || '暂不支持在线预览')}<br><span style="font-size:11.5px">请点右下角「下载原文件」</span></div>`;
+      openLightbox(Object.assign({}, base, { body: `<div data-att-preview="1">${inner}</div>` }));
+    } catch (e) {
+      openLightbox(Object.assign({}, base, {
+        body: `<div data-att-preview="1"><div class="att-pv-empty">预览失败：${esc(e.message)}，请下载原文件查看</div></div>`
+      }));
+    }
+    return;
+  }
+  openLightbox(Object.assign({}, base, {
+    body: `<div data-att-preview="1"><div style="text-align:center;padding:30px 0 12px">
+         <div class="att-thumb" style="width:96px;height:96px;margin:0 auto 12px;border:1px solid var(--line);border-radius:10px"><span class="ext">${esc(extOf(a.name))}</span></div>
+         <div style="font-size:13px;color:var(--ink-2)">${esc(a.name)}</div>
+         <div style="font-size:11.5px;color:var(--faint);margin-top:4px">${isCadFile(a.name) ? 'CAD / 工程图纸请用 AutoCAD 等专业软件打开' : '该文件暂不支持在线预览，请下载后查看'}</div>
+       </div></div>`
+  }));
+}
+
+/** 1.24.0：调用服务端生成 DocEditor 配置 → 按需加载 api.js → 只读渲染 Office 附件 */
+async function openOfficePreview(a, base) {
+  const holder = 'oo-editor-' + a.id;
+  openLightbox(Object.assign({}, base, {
+    body: `<div data-att-preview="1" data-oo-preview="1">
+      <div class="oo-state"><div class="oo-title">正在连接 OnlyOffice…</div>正在读取 Document Server 配置并加载在线阅读器</div>
+    </div>`
+  }));
+  try {
+    const cfg = await api('/onlyoffice/config/' + a.id);
+    await loadOoScript(cfg.script);
+    // 异步期间用户可能已经关窗，不要把编辑器挂到不存在的容器上
+    if (!/data-oo-preview="1"/.test($('#lightRoot').innerHTML)) return;
+    openLightbox(Object.assign({}, base, {
+      body: `<div data-att-preview="1" data-oo-preview="1">
+        <div id="${holder}" class="oo-editor"></div>
+        <div class="att-pv-note">由 OnlyOffice 以只读模式渲染，保留原文件排版、公式与图表；如需修改请下载原文件编辑后重新上传。</div>
+      </div>`
+    }));
+    if (!window.DocsAPI || !window.DocsAPI.DocEditor) throw new Error('Document Server 脚本未就绪');
+    S.ooEditor = new window.DocsAPI.DocEditor(holder, cfg.config);
+  } catch (e) {
+    openLightbox(Object.assign({}, base, {
+      body: `<div data-att-preview="1"><div class="oo-state">
+        <div class="oo-title">OnlyOffice 预览未能启动</div>
+        ${esc(e && e.message ? e.message : e)}
+        <div class="oo-diag">
+          <b>请依次检查：</b><br>
+          1. 系统设置 →「Office 在线预览」是否已启用并保存了正确的 Document Server 地址，可点「测试连接」验证；<br>
+          2. Document Server 必须能访问本应用以拉取原文件；若它运行在容器或另一台设备，请填写「本应用对外地址」；<br>
+          3. DocServer 7.2+ 默认开启 JWT，需要在两边填一致的密钥；<br>
+          4. 浏览器若拦截跨域脚本，请把 Document Server 与本应用放在同一内网并统一使用 http / https 访问。<br>
+          仍无法使用时可先「下载原文件」，或关闭 OnlyOffice 回到零依赖的内置预览。
+        </div>
+      </div></div>`
+    }));
+  }
+}
+
+async function deleteAttachment(id) {
+  const a = (S.data.attachments || []).find(x => x.id === Number(id));
+  if (!a) return;
+  confirmAsk('删除附件', `确定删除「${esc(a.name)}」？文件将从服务器移除，且不可恢复。`, async () => {
+    await api('/attachments/' + id, { method: 'DELETE' });
+    toast('附件已删除');
+    await syncAttachData(a.entity, a.entity_id);
+  });
+}
+
+const ATTACH_ENTITY_LABEL = { contracts: '合同', equipments: '设备', payment_plans: '付款节点', shops: '商铺', archives: '档案', warehouse_items: '物料', buildings: '楼栋' };
+
+/** 1.23.0：附件总览内容单独成块，上传 / 删除后可原地替换而不重建整个弹窗 */
+function attListBodyHtml(entity, eid) {
+  return `<div data-att-list="1" data-entity="${esc(entity)}" data-id="${eid}">
+      <div class="att-list-count" data-att-count="${esc(entity)}:${eid}">共 ${attsOf(entity, eid).length} 个附件</div>
+      ${attachPanelHtml(entity, eid, { title: false })}
+    </div>`;
+}
+
+function openAttList(entity, eid) {
+  const label = ATTACH_ENTITY_LABEL[entity] || '记录';
+  S.lightReturn = null;
+  S.lightReturnSig = '';
+  openLightbox({
+    title: '图片 / 附件',
+    sub: `${label} · 附件总览`,
+    body: attListBodyHtml(entity, eid),
+    size: 'md',
+    footer: `<button class="btn" data-act="closeLight">关闭</button>`
+  });
+  // 1.23.0：打开时以服务端为准校正，避免另一个页面上传后本页仍显示旧列表
+  fetchAttachments(entity, eid).then(ok => { if (ok) syncAttachUI(); });
+}
+
+/* ---------- 商铺水电抄表 / 费用账单：录入 · 编辑 · 删除（1.14.0） ---------- */
+function openReadingForm(shopId, readingId) {
+  const rec = readingId ? S.data.readings.find(x => x.id === Number(readingId)) : null;
+  if (readingId && !rec) return;
+  const sid = rec ? rec.shop_id : Number(shopId);
+  const s = S.data.shops.find(x => x.id === sid);
+  if (!s) return;
+  const isEdit = !!rec;
+  const last = S.data.readings.filter(r => r.shop_id === s.id && (!rec || r.id !== rec.id))
+    .sort((a, b) => String(b.period).localeCompare(String(a.period)))[0];
+  openForm({
+    title: isEdit ? '编辑水电抄表' : '录入水电抄表',
+    sub: `${s.name} · ${isEdit ? rec.period + ' · 保存后自动重算用量、费用与同账期账单' : '水 ' + num(s.water_price) + ' 元/吨 · 电 ' + num(s.elec_price) + ' 元/度'}`,
+    values: isEdit ? {
+      period: rec.period, read_date: rec.read_date || today(),
+      water_prev: rec.water_prev, water_curr: rec.water_curr,
+      elec_prev: rec.elec_prev, elec_curr: rec.elec_curr,
+      water_price: rec.water_price != null ? rec.water_price : s.water_price,
+      elec_price: rec.elec_price != null ? rec.elec_price : s.elec_price,
+      remark: rec.remark || ''
+    } : {
+      period: thisMonth(),
+      water_prev: last ? last.water_curr : '',
+      elec_prev: last ? last.elec_curr : '',
+      read_date: today()
+    },
+    fields: [
+      { k: 'period', label: '账期', type: 'month', required: true },
+      { k: 'read_date', label: '抄表日期', type: 'date', required: true },
+      { k: 'water_prev', label: '水表期初读数（吨）', type: 'number', step: '0.01', required: true },
+      { k: 'water_curr', label: '水表期末读数（吨）', type: 'number', step: '0.01', required: true },
+      { k: 'elec_prev', label: '电表期初读数（度）', type: 'number', step: '0.01', required: true },
+      { k: 'elec_curr', label: '电表期末读数（度）', type: 'number', step: '0.01', required: true },
+      { k: 'water_price', label: '水单价（元/吨）', type: 'number', step: '0.01', hint: '留空沿用抄表记录 / 商铺单价' },
+      { k: 'elec_price', label: '电单价（元/度）', type: 'number', step: '0.01' },
+      { k: 'remark', label: '备注', type: 'textarea', full: true }
+    ],
+    submitText: isEdit ? '保存修改' : '保存抄表',
+    onSubmit: async (v) => {
+      const r = isEdit
+        ? await api('/readings/' + rec.id, { method: 'PUT', body: v })
+        : await api('/shops/' + s.id + '/readings', { method: 'POST', body: v });
+      toast(`${isEdit ? '抄表已更新' : '已录入'}：水 ${num(r.water_usage)} 吨 / 电 ${num(r.elec_usage)} 度，合计 ${money((r.water_fee || 0) + (r.elec_fee || 0))}`);
+      await refresh(() => openShopDetail(s.id));
+    }
+  });
+}
+
+function openBillForm(shopId, billId) {
+  const rec = billId ? S.data.bills.find(x => x.id === Number(billId)) : null;
+  if (billId && !rec) return;
+  const sid = rec ? rec.shop_id : Number(shopId);
+  const s = S.data.shops.find(x => x.id === sid);
+  if (!s) return;
+  const isEdit = !!rec;
+  const moneyFields = [
+    { k: 'rent_amount', label: '租金（元）', type: 'number', step: '0.01' },
+    { k: 'water_amount', label: '水费（元）', type: 'number', step: '0.01' },
+    { k: 'elec_amount', label: '电费（元）', type: 'number', step: '0.01' },
+    { k: 'other_amount', label: '其他费用（元）', type: 'number', step: '0.01' }
+  ];
+  const extra = isEdit ? `<div class="field full bill-total-box">
+      <span>账单合计（自动计算）</span>
+      <div class="bill-total" id="billTotalPreview">—</div>
+      <span class="hint">合计 = 租金 + 水费 + 电费 + 其他费用；保存后自动重算，欠费统计、概览与导出同步更新</span>
+    </div>` : '';
+  openForm({
+    title: isEdit ? '编辑费用账单' : '生成月度账单',
+    sub: isEdit
+      ? `${s.name} · ${rec.period} · 可直接修正各项金额与收款状态`
+      : `${s.name} · 月租金 ${money(shopMonthly(s))}` +
+        (Number(s.rent_total) > 0 ? '（手动指定）' : `（按 ${num(s.area)}㎡ × ${num(shopUnitPrice(s))} 元/㎡ 计算）`),
+    values: isEdit ? {
+      period: rec.period, rent_amount: rec.rent_amount, water_amount: rec.water_amount,
+      elec_amount: rec.elec_amount, other_amount: rec.other_amount,
+      status: rec.status || 'unpaid', paid_date: rec.paid_date || '', remark: rec.remark || ''
+    } : { period: thisMonth(), other_amount: 0 },
+    fields: isEdit ? [
+      { k: 'period', label: '账期', type: 'month', required: true },
+      ...moneyFields,
+      { k: 'status', label: '收款状态', type: 'select', options: [{ k: 'unpaid', n: '未收' }, { k: 'paid', n: '已收' }] },
+      { k: 'paid_date', label: '收款日期', type: 'date', hint: '状态改为已收且留空时自动填今天' },
+      { k: 'remark', label: '备注', type: 'textarea', full: true }
+    ] : [
+      { k: 'period', label: '账期', type: 'month', required: true },
+      { k: 'other_amount', label: '其他费用（元）', type: 'number', step: '0.01', hint: '如公摊水电、垃圾清运等' },
+      { k: 'remark', label: '备注', type: 'textarea', full: true }
+    ],
+    extra,
+    submitText: isEdit ? '保存修改' : '生成账单',
+    onSubmit: async (v) => {
+      const b = isEdit
+        ? await api('/bills/' + rec.id, { method: 'PUT', body: v })
+        : await api('/shops/' + s.id + '/bills', { method: 'POST', body: v });
+      toast((isEdit ? '账单已更新：' : '账单已生成：') + money(b.total));
+      await refresh(() => openShopDetail(s.id));
+    },
+    onMounted: isEdit ? (form) => {
+      const box = form.querySelector('#billTotalPreview');
+      if (!box) return;
+      const calc = () => {
+        const sum = ['rent_amount', 'water_amount', 'elec_amount', 'other_amount'].reduce((n, k) => {
+          const el = form.querySelector(`[data-k="${k}"]`);
+          return n + (Number(el && el.value) || 0);
+        }, 0);
+        box.textContent = money(sum);
+      };
+      if (typeof form.addEventListener === 'function') form.addEventListener('input', calc);
+      calc();
+    } : null
+  });
+}
+
+function deleteReading(id) {
+  const r = S.data.readings.find(x => x.id === Number(id));
+  if (!r) return;
+  const s = S.data.shops.find(x => x.id === r.shop_id);
+  confirmAsk('删除水电抄表', `确定删除 ${esc(s ? s.name : '商铺')} ${esc(r.period)} 的抄表记录？<br><br>同账期的未收款账单会按剩余抄表自动重算水电费，已收款账单保持不变。`, async () => {
+    await api('/readings/' + r.id, { method: 'DELETE' });
+    toast('抄表记录已删除');
+    await refresh(() => openShopDetail(r.shop_id));
+  });
+}
+
+function deleteBill(id) {
+  const b = S.data.bills.find(x => x.id === Number(id));
+  if (!b) return;
+  const s = S.data.shops.find(x => x.id === b.shop_id);
+  confirmAsk('删除费用账单', `确定删除 ${esc(s ? s.name : '商铺')} ${esc(b.period)} 账单（${money(b.total)}）？<br><br>删除后欠费统计、概览与导出会同步更新，此操作不可恢复。`, async () => {
+    await api('/bills/' + b.id, { method: 'DELETE' });
+    toast('费用账单已删除');
+    await refresh(() => openShopDetail(b.shop_id));
+  });
+}
+
+function payBill(billId) {
+  const b = S.data.bills.find(x => x.id === Number(billId));
+  if (!b) return;
+  confirmAsk('登记收款', `确认 ${b.period} 账单（${money(b.total)}）已收到款项？`, async () => {
+    await api('/bills/' + b.id + '/pay', { method: 'POST', body: { paid_date: today() } });
+    toast('已登记收款');
+    await refresh(() => openShopDetail(b.shop_id));
+  }, '确认收款', false);
+}
+
+/* ---------- 设备维保 / 保养记录：新增 · 编辑 · 删除；保养状态快捷编辑（1.15.0） ---------- */
+function eqLogFields() {
+  return [
+    { k: 'type', label: '记录类型', type: 'select', required: true,
+      options: Object.keys(EQ_LOG_TYPES).map(k => ({ k, n: EQ_LOG_TYPES[k] })) },
+    { k: 'log_date', label: '日期', type: 'date', required: true },
+    { k: 'maintain_status', label: '保养状态', type: 'select', required: true,
+      options: MAINTAIN_OPTIONS, hint: '待保养 / 保养中 / 已完成 / 已延期；最新一条保养记录的状态同步到设备' },
+    { k: 'content', label: '处理内容', type: 'textarea', full: true, required: true,
+      placeholder: '描述检查结果、保养内容或故障处理措施' },
+    { k: 'cost', label: '费用（元）', type: 'number', step: '0.01' },
+    { k: 'operator', label: '经办人' },
+    { k: 'next_maintain', label: '下次保养日期', type: 'date', hint: '填写后同步更新设备保养计划；留空不修改' },
+    { k: 'resolve', label: '是否把设备状态置为正常', type: 'select',
+      options: [{ k: '0', n: '否' }, { k: '1', n: '是' }] }
+  ];
+}
+
+function openEqLogForm(eqId, logId) {
+  const rec = logId ? S.data.equipment_logs.find(x => x.id === Number(logId)) : null;
+  if (logId && !rec) return;
+  const eid = rec ? rec.equipment_id : Number(eqId);
+  const eq = S.data.equipments.find(x => x.id === eid);
+  if (!eq) return;
+  const isEdit = !!rec;
+  openForm({
+    title: isEdit ? '编辑维保 / 保养记录' : '新增设备记录',
+    sub: isEdit
+      ? `${eq.name} · ${EQ_LOG_TYPES[rec.type] || '记录'} ${rec.log_date || ''} · 可修正保养状态与各项内容`
+      : `${eq.name} · 巡检 / 保养 / 维修均可记录，并选择保养状态`,
+    values: isEdit ? {
+      type: rec.type || 'inspect', log_date: rec.log_date || today(),
+      maintain_status: MAINTAIN_STATUS[rec.maintain_status] ? rec.maintain_status : 'done',
+      content: rec.content || '', cost: rec.cost || '', operator: rec.operator || '',
+      next_maintain: rec.next_maintain || '', resolve: '0'
+    } : {
+      type: 'inspect', log_date: today(), maintain_status: 'done',
+      resolve: '0', next_maintain: ''
+    },
+    fields: eqLogFields(),
+    submitText: isEdit ? '保存修改' : '保存记录',
+    onSubmit: async (v) => {
+      const r = isEdit
+        ? await api('/equipment_logs/' + rec.id, { method: 'PUT', body: v })
+        : await api('/equipments/' + eid + '/logs', { method: 'POST', body: v });
+      const st = (MAINTAIN_STATUS[r && r.maintain_status] || MAINTAIN_STATUS.done)[0];
+      toast(`${isEdit ? '记录已更新' : '记录已保存'} · 保养状态 ${st}`);
+      await refresh(() => openEqDetail(eid));
+    }
+  });
+}
+
+function deleteEqLog(id) {
+  const rec = S.data.equipment_logs.find(x => x.id === Number(id));
+  if (!rec) return;
+  confirmAsk('删除维保记录',
+    `确定删除 ${esc(EQ_LOG_TYPES[rec.type] || '记录')}（${esc(rec.log_date || '')}）？<br><br>若为最新一条保养记录，设备保养状态会按剩余记录自动回退；此操作不可恢复。`,
+    async () => {
+      await api('/equipment_logs/' + rec.id, { method: 'DELETE' });
+      toast('维保记录已删除');
+      await refresh(() => openEqDetail(rec.equipment_id));
+    });
+}
+
+function openEqMaintainForm(eqId) {
+  const eq = S.data.equipments.find(x => x.id === Number(eqId));
+  if (!eq) return;
+  const cur = String(eq.maintain_status || 'auto');
+  const info = eqMaintainInfo(eq);
+  openForm({
+    title: '编辑设备保养状态',
+    sub: `${eq.name} · 当前 ${info.label}${info.manual ? '（手动设定）' : '（按日期自动判断）'}`,
+    values: {
+      maintain_status: MAINTAIN_STATUS[cur] ? cur : 'auto',
+      next_maintain: eq.next_maintain || '', note: '', add_log: '1'
+    },
+    fields: [
+      { k: 'maintain_status', label: '保养状态', type: 'select', required: true,
+        options: [{ k: 'auto', n: '按日期自动（默认）' }, ...MAINTAIN_OPTIONS],
+        hint: '手动选择后立即生效；标记「已完成」的设备不再进入待保养提醒' },
+      { k: 'next_maintain', label: '下次保养日期', type: 'date', hint: '修改后同步更新设备保养计划' },
+      { k: 'note', label: '保养说明（可选）', type: 'textarea', full: true,
+        placeholder: '如：已完成季度保养，滤网清洗、冷媒压力正常' },
+      { k: 'add_log', label: '把说明写成一条保养记录', type: 'select',
+        options: [{ k: '1', n: '是（推荐）' }, { k: '0', n: '否' }],
+        hint: '填写说明且选「是」时，自动追加一条带当前状态的保养记录，便于追溯' }
+    ],
+    submitText: '保存保养状态',
+    onSubmit: async (v) => {
+      const r = await api('/equipments/' + eq.id + '/maintain', { method: 'PUT', body: v });
+      toast('保养状态已更新 · ' + eqMaintainInfo(r).label);
+      await refresh(() => openEqDetail(eq.id));
+    }
+  });
+}
+
+function openProgressForm(contractId) {
+  const c = S.data.contracts.find(x => x.id === Number(contractId));
+  if (!c) return;
+  openForm({
+    title: '上报施工进度',
+    sub: `${c.name} · 当前 ${c.progress || 0}%`,
+    values: { progress: clamp((c.progress || 0) + 5, 0, 100), log_date: today() },
+    fields: [
+      { k: 'progress', label: '本次进度（%）', type: 'number', step: '1', required: true, hint: '达到付款节点条件时，会自动解锁对应付款计划' },
+      { k: 'log_date', label: '日期', type: 'date', required: true },
+      { k: 'title', label: '节点标题', placeholder: '如：外墙腻子施工完成', full: true },
+      { k: 'content', label: '施工内容', type: 'textarea', full: true },
+      { k: 'operator', label: '上报人' }
+    ],
+    submitText: '提交进度',
+    onSubmit: async (v) => {
+      const r = await api('/contracts/' + c.id + '/progress', { method: 'POST', body: v });
+      toast(r.unlocked && r.unlocked.length
+        ? `进度已更新，已解锁付款节点：${r.unlocked.join('、')}`
+        : '施工进度已更新');
+      await refresh(() => openContractDetail(c.id));
+    }
+  });
+}
+
+function openPlanForm(contractId, planId) {
+  const plan = planId ? S.data.payment_plans.find(x => x.id === Number(planId)) : null;
+  const c = S.data.contracts.find(x => x.id === Number(plan ? plan.contract_id : contractId));
+  if (!c) return;
+  const used = c.plans.reduce((n, p) => n + (Number(p.ratio) || 0), 0);
+  const isEdit = !!plan;
+  const total = Number(c.amount) || 0;
+  // 金额 ⇄ 比例 双向联动：改金额自动算比例，改比例自动算金额
+  const syncFromAmount = (form) => {
+    const amtEl = form.querySelector('[data-k="amount"]');
+    const ratEl = form.querySelector('[data-k="ratio"]');
+    if (!amtEl || !ratEl) return;
+    amtEl.addEventListener('input', () => {
+      const a = Number(amtEl.value);
+      if (Number.isFinite(a) && a > 0 && total > 0) ratEl.value = String(Math.round(a / total * 1000) / 10);
+    });
+    ratEl.addEventListener('input', () => {
+      const r = Number(ratEl.value);
+      if (Number.isFinite(r) && r > 0 && total > 0) amtEl.value = String(Math.round(total * r) / 100);
+    });
+  };
+
+  openForm({
+    title: isEdit ? '编辑付款节点' : '追加付款节点',
+    sub: `${c.name} · ${isEdit ? `第 ${plan.seq} 期 · 当前状态 ${(PLAN_STATUS[plan.status] || ['未知'])[0]}` : `已分配比例 ${used}%（合同金额 ${money(c.amount)}）`}`,
+    values: isEdit ? plan : { trigger_type: 'progress', due_date: c.end_date || '', ratio: 10, amount: Math.round(total * 10) / 100, seq: c.plans.length + 1 },
+    fields: [
+      { k: 'name', label: '节点名称', required: true, placeholder: '如：中期进度款' },
+      { k: 'seq', label: '期次', type: 'number' },
+      { k: 'amount', label: '节点金额（元）', type: 'number', step: '0.01', required: true,
+        hint: `手动输入金额，自动计算占合同比例（合同总额 ${money(c.amount)}）` },
+      { k: 'ratio', label: '占合同比例（%）', type: 'number', step: '0.1',
+        hint: '与金额双向联动，改比例会自动反算金额' },
+      { k: 'trigger_type', label: '触发方式', type: 'select', required: true, options: [{ k: 'sign', n: '签约即付' }, { k: 'progress', n: '按施工进度' }, { k: 'date', n: '按约定日期' }] },
+      { k: 'trigger_value', label: '进度阈值（%）', type: 'number', step: '1', hint: '触发方式为「按施工进度」时生效' },
+      { k: 'due_date', label: '应付日期', type: 'date' },
+      { k: 'remark', label: '备注', type: 'textarea', full: true }
+    ],
+    submitText: isEdit ? '保存' : '添加节点',
+    onMounted: syncFromAmount,
+    onSubmit: async (v) => {
+      // 以手动输入的金额为准自动计算比例；金额为空时按比例反算
+      const amt = Number(v.amount);
+      if (Number.isFinite(amt) && amt > 0) {
+        v.amount = round2(amt);
+        v.ratio = total > 0 ? Math.round(amt / total * 1000) / 10 : 0;
+      } else {
+        const r = Number(v.ratio) || 0;
+        v.amount = round2(total * r / 100);
+      }
+      if (isEdit) {
+        await api('/payment_plans/' + plan.id, { method: 'PUT', body: v });
+        toast('付款节点已更新');
+      } else {
+        await api('/contracts/' + c.id + '/plans', { method: 'POST', body: v });
+        toast('付款节点已添加');
+      }
+      await refresh(() => { if (contractId) openContractDetail(Number(contractId)); });
+    },
+    attach: isEdit ? { entity: 'payment_plans', id: plan.id } : null
+  });
+}
+
+function openPayForm(planId) {
+  const p = S.data.payment_plans.find(x => x.id === Number(planId));
+  if (!p) return;
+  const c = S.data.contracts.find(x => x.id === p.contract_id) || {};
+  const planAmt = Number(p.amount) || 0;
+  const contractAmt = Number(c.amount) || 0;
+  openForm({
+    title: '登记付款',
+    sub: `${c.name || ''} · ${p.name}`,
+    values: { amount: p.amount, pay_date: today(), method: '转账' },
+    fields: [
+      { k: 'amount', label: '付款金额（元）', type: 'number', step: '0.01', required: true, hint: `计划金额 ${money(p.amount)}` },
+      { k: 'pay_date', label: '付款日期', type: 'date', required: true },
+      { k: 'method', label: '付款方式', type: 'select', options: [{ k: '转账', n: '银行转账' }, { k: '支票', n: '支票' }, { k: '现金', n: '现金' }, { k: '承兑', n: '承兑汇票' }] },
+      { k: 'voucher_no', label: '凭证号' },
+      { k: 'operator', label: '经办人' },
+      { k: 'remark', label: '备注', type: 'textarea', full: true }
+    ],
+    submitText: '确认付款',
+    onMounted: (form) => {
+      // 手动输入付款金额，实时自动计算占计划金额 / 占合同总额比例
+      const amtEl = form.querySelector('[data-k="amount"]');
+      const hintEl = amtEl && amtEl.closest('label') ? amtEl.closest('label').querySelector('.hint') : null;
+      if (!amtEl || !hintEl) return;
+      const upd = () => {
+        const a = Number(amtEl.value);
+        const parts = [`计划金额 ${money(planAmt)}`];
+        if (Number.isFinite(a) && a > 0) {
+          if (planAmt > 0) parts.push(`占计划 ${Math.round(a / planAmt * 1000) / 10}%`);
+          if (contractAmt > 0) parts.push(`占合同 ${Math.round(a / contractAmt * 1000) / 10}%`);
+        }
+        hintEl.textContent = parts.join(' · ');
+      };
+      amtEl.addEventListener('input', upd);
+      upd();
+    },
+    onSubmit: async (v) => {
+      await api('/payment_plans/' + p.id + '/pay', { method: 'POST', body: v });
+      toast('付款已登记');
+      await refresh(() => openContractDetail(p.contract_id));
+    }
+  });
+}
+
+/* ---------------- 设置操作 ---------------- */
+/** 1.24.0：设置页一键探测 Document Server，直接用输入框当前值，不必先保存整页 */
+async function testOoServerUI() {
+  const hint = $('#ooStatusHint');
+  const setHint = (txt, cls) => {
+    if (!hint) return;
+    hint.textContent = txt;
+    if (hint.classList) hint.className = 'oo-status' + (cls ? ' ' + cls : '');
+  };
+  const root = $('#view');
+  const inp = root && root.querySelector ? root.querySelector('[data-k="oo_server"]') : null;
+  const typed = inp && typeof inp.value === 'string' ? inp.value.trim() : '';
+  const server = typed || String((S.settings || {}).oo_server || '');
+  if (!server) {
+    setHint('请先填写 Document Server 地址', 'bad');
+    toast('请先填写 Document Server 地址', 'err');
+    return;
+  }
+  setHint('正在连接…');
+  try {
+    const r = await api('/onlyoffice/status?server=' + encodeURIComponent(server));
+    const ok = !!r.connected;
+    setHint(ok ? `连接成功（${r.probe || 'healthcheck'} · HTTP ${r.status || 200}）` : ('连接失败：' + (r.error || '未知原因')), ok ? 'ok' : 'bad');
+    toast(ok ? 'Document Server 连接正常' : 'Document Server 连接失败', ok ? '' : 'err');
+  } catch (e) {
+    setHint('连接失败：' + (e && e.message ? e.message : e), 'bad');
+    toast('测试连接失败', 'err');
+  }
+}
+
+async function saveSettingsUI() {
+  const root = $('#view');
+  const data = {};
+  $$('[data-k]', root).forEach(el => {
+    const k = el.dataset && el.dataset.k;
+    if (SETTING_KEYS.indexOf(k) < 0) return;
+    data[k] = typeof el.value === 'string' ? el.value.trim() : (el.value == null ? '' : el.value);
+  });
+  if (!Object.keys(data).length) { toast('没有可保存的设置项', 'err'); return; }
+  const btns = $$('[data-act="saveSettings"]');
+  const labels = btns.map(b => b.textContent);
+  btns.forEach(b => { b.disabled = true; b.textContent = '保存中…'; });
+  const restore = () => btns.forEach((b, i) => { b.disabled = false; b.textContent = labels[i]; });
+  try {
+    const saved = await api('/settings', { method: 'PUT', body: data });
+    S.settings = (saved && typeof saved === 'object') ? saved : S.settings;
+    if (S.data) S.data.settings = S.settings;
+    toast('设置已保存并生效');
+    // 用服务端返回的结果重绘，界面与落库值保持一致（空值也会被真实写入）
+    render();
+  } catch (e) {
+    toast('保存失败：' + (e && e.message ? e.message : e), 'err');
+  } finally {
+    restore();
+  }
+}
+
+function resetSettingsUI() {
+  confirmAsk('恢复默认设置',
+    '将把项目信息、计费默认值、提醒天数与显示偏好恢复为出厂设置。<br><br>商铺、设备、合同、付款等<b>业务数据不会被删除</b>。',
+    async () => {
+      const def = await api('/settings/reset', { method: 'POST' });
+      S.settings = (def && typeof def === 'object') ? def : {};
+      if (S.data) S.data.settings = S.settings;
+      toast('已恢复默认设置');
+      render();
+    }, '恢复默认', false);
+}
+
+function downloadBackup() {
+  const a = document.createElement('a');
+  a.href = API_BASE + '/backup';
+  a.rel = 'noopener';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  toast('正在生成数据备份…');
+}
+
+/* ============================================================
+   登录 / 退出
+   ============================================================ */
+function showLogin(msg) {
+  closeNav(); // 1.25.0：登录遮罩出现时收起抽屉
+  const root = $('#loginRoot');
+  if (!root) return;
+  if (!root.innerHTML) {
+    root.innerHTML = `
+    <div class="login-mask">
+      <div class="login-card">
+        <div class="login-logo"><svg viewBox="0 0 24 24"><path d="M3 21h18M5 21V8l7-4.5L19 8v13M9.5 21v-6h5v6M9 10.5h.01M15 10.5h.01"/></svg></div>
+        <div class="login-title">物业工程管理</div>
+        <div class="login-sub">商铺 · 设备 · 项目合同 · 付款 一体化管理</div>
+        <div class="login-field"><label>用户名</label>
+          <input id="loginUser" autocomplete="username" placeholder="请输入用户名" onkeydown="if(event.key==='Enter')doLogin()"></div>
+        <div class="login-field"><label>密码</label>
+          <input id="loginPass" type="password" autocomplete="current-password" placeholder="请输入密码" onkeydown="if(event.key==='Enter')doLogin()"></div>
+        <button class="login-btn" id="loginBtn" data-act="loginSubmit">登　录</button>
+        <div class="login-err" id="loginErr"></div>
+        <div class="login-foot">登录成功后默认进入「可视化驾驶舱」<br>飞牛 fnOS 应用 · 开发者 无冰咖啡糖<br>首次使用请用初始管理员登录：admin / admin123</div>
+      </div>
+    </div>`;
+    document.body.style.overflow = 'hidden';
+  }
+  const err = $('#loginErr');
+  if (msg && err) { err.textContent = msg; err.classList.add('show'); }
+  setTimeout(() => { const el = $('#loginUser'); if (el) el.focus(); }, 80);
+}
+
+function hideLogin() {
+  const root = $('#loginRoot');
+  if (root) root.innerHTML = '';
+  document.body.style.overflow = '';
+}
+
+async function doLogin() {
+  const u = $('#loginUser'), p = $('#loginPass'), err = $('#loginErr'), btn = $('#loginBtn');
+  if (!u || !p) return;
+  if (btn && btn.disabled) return;               // 防重复提交
+  const un = (u.value || '').trim(), pw = p.value || '';
+  if (err) err.classList.remove('show');
+  if (!un || !pw) {
+    if (err) { err.textContent = '请输入用户名和密码'; err.classList.add('show'); }
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = '登录中…'; }
+  try {
+    const info = await api('/auth/login', { method: 'POST', body: { username: un, password: pw }, _noGate: true });
+    S.auth = info;
+    /* 1.17.0：每次登录固定进入可视化驾驶舱，重置分析维度 / 时间 / 楼栋 / 下钻，
+       并清掉「上次模块」记忆，避免带着旧模块或旧筛选进入首页。 */
+    S.view = COCKPIT_VIEW;
+    S.cockpitTab = 'overview';
+    S.dashRange = '6'; S.dashBuilding = 'all'; S.dashDrill = null;
+    try { localStorage.removeItem('pmops_last_view'); } catch (e) {}
+    if (btn) btn.textContent = '正在载入驾驶舱…';
+    // 登录遮罩保持到 bootstrap 就绪（load 成功后才 hideLogin），不再闪一下空白主界面
+    await load();
+    hideLogin();
+    toast('欢迎，' + (info.name || info.username) + ' · 已进入可视化驾驶舱');
+    if (info.password_is_default) setTimeout(() => toast('正在使用初始密码，请尽快在「系统设置 → 用户管理」中修改', 'err'), 600);
+  } catch (e) {
+    showLogin(e.message);                         // 载入失败时保证遮罩仍在
+    const eb = $('#loginErr');
+    if (eb) { eb.textContent = e.message; eb.classList.add('show'); }
+    const b2 = $('#loginBtn');
+    if (b2) { b2.disabled = false; b2.textContent = '登　录'; }
+    if (p) { p.value = ''; setTimeout(() => { if (typeof p.focus === 'function') p.focus(); }, 0); }
+  }
+}
+
+async function doLogout() {
+  try { await api('/auth/logout', { method: 'POST' }); } catch (e) {}
+  S.auth = null;
+  S.data = null;
+  S.users = null;
+  S.view = COCKPIT_VIEW;
+  try { localStorage.removeItem('pmops_last_view'); } catch (e) {}
+  disposeCharts();
+  renderUserChip();
+  $('#view').innerHTML = '';
+  const ta = $('#topActions'); if (ta) ta.innerHTML = '';
+  showLogin('已退出登录');
+}
+
+function renderUserChip() {
+  const el = $('#userChip');
+  if (!el) return;
+  const u = S.auth;
+  if (!u) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'flex';
+  el.innerHTML = `<span class="u-name">${esc(u.name || u.username)}</span>` +
+    `<span class="u-role">${esc(ROLE_LABEL[u.role] || u.role || '')}</span>` +
+    `<button class="u-out" data-act="logout" title="退出登录"><svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/></svg></button>`;
+}
+
+/* ============================================================
+   用户管理（仅管理员）
+   ============================================================ */
+const MOD_META = [
+  ['dashboard', '可视化驾驶舱', 'M4 20V10M10 20V4M16 20v-6M22 20H2'],
+  ['shops', '商铺管理', 'M4 9h16v11H4zM3 9l1.6-4h14.8L21 9M9 20v-5h6v5'],
+  ['equipments', '设备管理', 'M4 7h16v9H4zM8 7V5h8v2M8 16v3M16 16v3M8.5 11.5h7'],
+  ['contracts', '项目合同管理', 'M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-5zM14 3v5h5'],
+  ['payments', '项目付款台帐', 'M3 7h18v12H3zM3 7l2-3h14l2 3M8 13h3'],
+  ['archives', '档案管理', 'M4 4h6a2 2 0 012 2v14a2 2 0 00-2-2H4zM20 4h-6a2 2 0 00-2 2v14a2 2 0 012-2h6zM8 8h2M14 8h2'],
+  ['warehouse', '仓库管理', 'M3 9l9-5 9 5v11H3zM8 20v-7h8v7M3 9h18']
+];
+
+function modListHtml() {
+  const d = S.data || {};
+  const counts = {
+    shops: (d.shops || []).length,
+    equipments: (d.equipments || []).length,
+    contracts: (d.contracts || []).length,
+    payment_plans: (d.payment_plans || []).length,
+    archives: (d.archives || []).length,
+    warehouse: (d.warehouse_items || []).length
+  };
+  return MOD_META.map(([k, n, icon]) => `
+    <div class="mod-item">
+      <span class="ic"><svg viewBox="0 0 24 24"><path d="${icon}"/></svg></span>${n}
+      <span class="n">${k === COCKPIT_VIEW ? '视图' : (counts[k] || 0) + ' 条'}</span>
+    </div>`).join('');
+}
+
+function viewUsers() {
+  const users = S.users || [];
+  const admins = users.filter(u => u.role === 'admin').length;
+  const enabled = users.filter(u => u.enabled).length;
+  const viewers = users.filter(u => u.role === 'viewer').length;
+  return `
+  <div class="stats" style="grid-template-columns:repeat(4,1fr)">
+    <div class="stat"><div class="lbl">账号总数</div><div class="val">${users.length}<small>个</small></div><div class="sub">含停用账号</div></div>
+    <div class="stat green"><div class="lbl">启用中</div><div class="val">${enabled}<small>个</small></div><div class="sub">可正常登录</div></div>
+    <div class="stat"><div class="lbl">管理员</div><div class="val">${admins}<small>个</small></div><div class="sub">拥有全部权限</div></div>
+    <div class="stat amber"><div class="lbl">只读账号</div><div class="val">${viewers}<small>个</small></div><div class="sub">仅可查看与导出</div></div>
+  </div>
+  <div class="row" style="display:flex;gap:8px;align-items:center;margin:14px 0 12px">
+    <button class="btn btn-primary" data-act="newUser"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新增用户</button>
+    <button class="btn" data-act="refreshUsers"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7M21 3v6h-6"/></svg>刷新</button>
+    <span class="t-sub" style="margin-left:auto">角色权限：管理员 · 全部功能 ｜ 操作员 · 日常业务 ｜ 只读 · 仅查看与导出</span>
+  </div>
+  <div class="card"><div class="card-body" style="padding:0">
+    <div id="usersBody">${S.users ? usersTableHtml() : '<div class="loading"><div class="spinner"></div>正在读取用户…</div>'}</div>
+  </div></div>`;
+}
+
+function usersTableHtml() {
+  const users = S.users || [];
+  const rolePill = (r) => `<span class="role-pill role-${esc(r)}">${esc(ROLE_LABEL[r] || r)}</span>`;
+  return `<div class="table-wrap" style="border:none">
+    <table>
+      <thead><tr><th>用户</th><th>角色</th><th>状态</th><th>最近登录</th><th>创建时间</th><th style="width:210px">操作</th></tr></thead>
+      <tbody>
+      ${users.length ? users.map(u => `<tr>
+        <td><div class="t-main">${esc(u.name || u.username)}${u.username === (S.auth || {}).username ? ' <span class="t-sub">（我）</span>' : ''}</div>
+            <div class="t-sub">${esc(u.username)}${u.remark ? ' · ' + esc(u.remark) : ''}</div></td>
+        <td>${rolePill(u.role)}</td>
+        <td>${u.enabled ? '<span class="pill ok">启用</span>' : '<span class="pill warn">停用</span>'}</td>
+        <td class="t-sub">${esc(String(u.last_login || '—').replace('T', ' ').slice(0, 19))}</td>
+        <td class="t-sub">${esc(String(u.created_at || '—').slice(0, 10))}</td>
+        <td>
+          <button class="btn-link" data-act="editUser" data-id="${u.id}">编辑</button>
+          <button class="btn-link" data-act="toggleUser" data-id="${u.id}">${u.enabled ? '停用' : '启用'}</button>
+          <button class="btn-link" style="color:var(--red)" data-act="delUser" data-id="${u.id}">删除</button>
+        </td>
+      </tr>`).join('') : '<tr><td colspan="6"><div class="empty">还没有账号</div></td></tr>'}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+async function loadUsers() {
+  const box = $('#usersBody');
+  try {
+    S.users = await api('/users');
+    if (!$('#usersBody')) return;
+    $('#usersBody').innerHTML = usersTableHtml();
+    // 统计卡同步刷新
+    const vs = $('#view').querySelectorAll('.stat .val');
+    if (vs.length === 4) {
+      const us = S.users || [];
+      vs[0].innerHTML = us.length + '<small>个</small>';
+      vs[1].innerHTML = us.filter(u => u.enabled).length + '<small>个</small>';
+      vs[2].innerHTML = us.filter(u => u.role === 'admin').length + '<small>个</small>';
+      vs[3].innerHTML = us.filter(u => u.role === 'viewer').length + '<small>个</small>';
+    }
+  } catch (e) {
+    if (box) box.innerHTML = `<div class="empty">读取失败：${esc(e.message)}</div>`;
+  }
+}
+
+function userForm(id) {
+  const u = id ? (S.users || []).find(x => x.id === Number(id)) : null;
+  openForm({
+    title: u ? '编辑用户' : '新增用户',
+    sub: u ? u.username : '创建应用登录账号',
+    values: u
+      ? { username: u.username, name: u.name, role: u.role, enabled: u.enabled ? '1' : '0', remark: u.remark }
+      : { role: 'operator', enabled: '1' },
+    fields: [
+      { k: 'username', label: '用户名', required: true, hint: u ? '用户名不可修改' : '2-20 位字母 / 数字 / 汉字 / - _' },
+      { k: 'name', label: '姓名 / 显示名' },
+      { k: 'role', label: '角色', type: 'select', options: [{ k: 'admin', n: '管理员' }, { k: 'operator', n: '操作员' }, { k: 'viewer', n: '只读' }], hint: '管理员可管理用户与设置；操作员处理日常业务；只读仅可查看' },
+      { k: 'password', label: u ? '重置密码' : '初始密码', hint: u ? '留空表示不修改密码' : '至少 6 位，创建后请转告本人' },
+      { k: 'enabled', label: '状态', type: 'select', options: [{ k: '1', n: '启用' }, { k: '0', n: '停用' }] },
+      { k: 'remark', label: '备注', full: true }
+    ],
+    submitText: u ? '保存' : '创建',
+    onSubmit: async (v) => {
+      const payload = { name: v.name, role: v.role, enabled: v.enabled, remark: v.remark };
+      if (v.password) payload.password = v.password;
+      if (u) {
+        await api('/users/' + u.id, { method: 'PUT', body: payload });
+        toast('用户已更新');
+      } else {
+        payload.username = v.username;
+        await api('/users', { method: 'POST', body: payload });
+        toast('用户已创建');
+      }
+      S.users = await api('/users');
+      render();
+    }
+  });
+}
+
+/* ============================================================
+   操作日志
+   ============================================================ */
+const ACT_FILTERS = [
+  { k: 'today', n: '今天' }, { k: '7', n: '近 7 天' }, { k: '30', n: '近 30 天' }, { k: 'all', n: '全部' }
+];
+
+const actTone = (a) => /删除|清空/.test(a) ? 'act-del'
+  : /新增|创建|录入|上传|生成|登记/.test(a) ? 'act-add'
+  : /修改|恢复|重置/.test(a) ? 'act-edit'
+  : /登录|退出|密码/.test(a) ? 'act-auth' : '';
+
+const fmtDT = (ts) => String(ts || '').replace('T', ' ').slice(0, 19);
+
+function viewAudit() {
+  return `<div class="card"><div class="card-body" style="padding:0">
+    <div id="auditBody">${S.auditData ? auditBodyHtml(S.auditData) : '<div class="loading"><div class="spinner"></div>正在读取日志…</div>'}</div>
+  </div></div>`;
+}
+
+function auditBodyHtml(j) {
+  const q = S.auditQ;
+  const rows = j.rows || [];
+  const st = j.stats || {};
+  const chip = (c) => `<button class="chip ${String(q.days) === String(c.k) ? 'active' : ''}" data-act="auditDays" data-days="${c.k}">${c.n}</button>`;
+  return `
+  <div style="padding:14px 16px 0">
+    <div class="stats" style="grid-template-columns:repeat(4,1fr);margin:0 0 12px">
+      <div class="stat"><div class="lbl">今日操作</div><div class="val">${st.today || 0}<small>条</small></div><div class="sub">所有用户</div></div>
+      <div class="stat"><div class="lbl">近 7 天</div><div class="val">${st.week || 0}<small>条</small></div><div class="sub">所有用户</div></div>
+      <div class="stat"><div class="lbl">筛选结果</div><div class="val">${j.total || 0}<small>条</small></div><div class="sub">最多显示 300 条</div></div>
+      <div class="stat"><div class="lbl">日志总量</div><div class="val">${st.all || 0}<small>条</small></div><div class="sub">超 5000 条自动清理最旧</div></div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+      <select class="btn" style="height:34px;padding:0 8px" data-audit-filter="user">
+        <option value="">全部用户</option>
+        ${(j.users || []).map(u => `<option value="${esc(u)}" ${q.user === u ? 'selected' : ''}>${esc(u)}</option>`).join('')}
+      </select>
+      <select class="btn" style="height:34px;padding:0 8px" data-audit-filter="module">
+        <option value="">全部模块</option>
+        ${(j.modules || []).map(m => `<option value="${esc(m)}" ${q.module === m ? 'selected' : ''}>${esc(m)}</option>`).join('')}
+      </select>
+      <input id="auditSearch" class="btn" style="height:34px;width:200px;padding:0 10px" placeholder="搜索动作 / 对象 / 详情…" value="${esc(q.q || '')}">
+      <div style="display:flex;gap:4px">${ACT_FILTERS.map(chip).join('')}</div>
+      <button class="btn" data-act="auditRefresh"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7M21 3v6h-6"/></svg>刷新</button>
+      ${isAdmin() ? `<button class="btn" style="color:var(--red);margin-left:auto" data-act="clearLogs">清空日志</button>` : ''}
+    </div>
+  </div>
+  <div class="table-wrap" style="border:none;border-top:1px solid var(--line-2)">
+    <table>
+      <thead><tr><th style="width:130px">时间</th><th style="width:90px">用户</th><th style="width:110px">动作</th>
+        <th style="width:100px">模块</th><th style="width:170px">对象</th><th>详情</th></tr></thead>
+      <tbody>
+      ${rows.length ? rows.map(r => {
+        const ts = fmtDT(r.ts);
+        return `<tr>
+          <td><div class="t-main">${esc(ts.slice(11))}</div><div class="t-sub">${esc(ts.slice(0, 10))}</div></td>
+          <td>${esc(r.user || '—')}</td>
+          <td><span class="act-pill ${actTone(r.action)}">${esc(r.action)}</span></td>
+          <td class="t-sub">${esc(r.module || '—')}</td>
+          <td>${esc(r.target || '—')}</td>
+          <td><div class="log-detail" title="${esc(r.detail || '')}">${esc(r.detail || '—')}</div></td>
+        </tr>`;
+      }).join('') : '<tr><td colspan="6"><div class="empty">没有符合条件的日志</div></td></tr>'}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+async function loadAudit() {
+  const q = S.auditQ;
+  const params = new URLSearchParams();
+  if (q.user) params.set('user', q.user);
+  if (q.module) params.set('module', q.module);
+  if (q.q) params.set('q', q.q);
+  if (q.days && q.days !== 'all') params.set('days', q.days);
+  params.set('limit', '300');
+  try {
+    const j = await api('/audit_logs?' + params.toString());
+    S.auditData = j;
+    const box = $('#auditBody');
+    if (box) box.innerHTML = auditBodyHtml(j);
+  } catch (e) {
+    const box = $('#auditBody');
+    if (box) box.innerHTML = `<div class="empty">读取失败：${esc(e.message)}</div>`;
+  }
+}
+
+/* ============================================================
+   事件分发
+   ============================================================ */
+document.addEventListener('click', async (e) => {
+  // 拖动刚结束时，浏览器补发的那一次 click 不参与分发（防止误触按钮）
+  if (dragSuppressClick()) {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    return;
+  }
+  // 1.20.0：点遮罩空白处只吞事件，不关闭弹窗；关闭只认「关闭」按钮 / 右上角 ×
+  if (handleOverlayClick(e)) return;
+
+  const btn = e.target.closest('[data-act]');
+  if (!btn) return;
+  const act = btn.dataset.act;
+  const id = btn.dataset.id;
+  const k = btn.dataset.k;
+
+  try {
+    switch (act) {
+      /* 1.25.0：移动端抽屉导航（导航面板，不是弹窗，不受逐层关闭规则约束） */
+      case 'navToggle': toggleNav(); break;
+      case 'closeNav': closeNav(); break;
+      case 'nav':
+        setView(btn.dataset.view);
+        closeModal();
+        render();
+        break;
+      case 'saveSettings': await saveSettingsUI(); break;
+      case 'resetSettings': resetSettingsUI(); break;
+      case 'backup': downloadBackup(); break;
+      case 'loginSubmit': await doLogin(); break;
+      case 'logout': await doLogout(); break;
+      case 'newUser': userForm(); break;
+      case 'editUser': userForm(id); break;
+      case 'refreshUsers': await loadUsers(); break;
+      case 'toggleUser': {
+        const tu = (S.users || []).find(x => x.id === Number(id));
+        if (!tu) break;
+        await api('/users/' + id, { method: 'PUT', body: { enabled: tu.enabled ? '0' : '1' } });
+        toast(tu.enabled ? '已停用' : '已启用');
+        S.users = await api('/users');
+        render();
+        break;
+      }
+      case 'delUser': {
+        const du = (S.users || []).find(x => x.id === Number(id));
+        if (!du) break;
+        confirmAsk('删除用户', `确定删除「${esc(du.name || du.username)}」？该账号将无法再登录。`, async () => {
+          await api('/users/' + id, { method: 'DELETE' });
+          toast('用户已删除');
+          S.users = await api('/users');
+          render();
+        });
+        break;
+      }
+      case 'clearLogs':
+        confirmAsk('清空操作日志', '将删除<b>全部</b>留痕记录，此操作不可恢复。<br><br>建议先「下载数据备份」留存。',
+          async () => {
+            const r = await api('/audit_logs', { method: 'DELETE' });
+            toast('已清空 ' + ((r && r.removed) || 0) + ' 条日志');
+            loadAudit();
+          }, '确认清空', true);
+        break;
+      case 'auditDays':
+        S.auditQ.days = btn.dataset.days || '30';
+        loadAudit();
+        break;
+      case 'auditRefresh': await loadAudit(); break;
+      case 'closeModal':
+        closeModal();
+        break;
+      case 'closeLight':
+        closeLightbox();
+        break;
+      case 'attSheet': switchAttSheet(k); break;
+      case 'previewExport': await openExportPreview(); break;
+      // 1.24.0：内置预览 ↔ OnlyOffice 互相切换；设置页一键测试 Document Server
+      case 'officePreview': await openAttPreview(id, 'office'); break;
+      case 'builtinPreview': await openAttPreview(id, 'builtin'); break;
+      case 'testOoServer': await testOoServerUI(); break;
+      case 'printContract':
+        printContract(id);
+        break;
+      case 'submitForm':
+        if (S.formSubmit) await S.formSubmit();
+        break;
+      case 'confirmOk':
+        // 确认执行（多为删除）：不回退到旧弹窗，直接关闭
+        if (S.formSubmit) { const fn = S.formSubmit; S.modalReturn = null; closeModal(); await fn(); }
+        break;
+
+      case 'shopStatus': S.shopStatus = normalizeShopStatus(k); render(); break;
+      /* 1.26.0：商铺管理内的楼栋子页 / 台账操作 */
+      case 'shopTab':
+        S.shopTab = k === 'buildings' ? 'buildings' : 'shops';
+        render();
+        break;
+      case 'shopBuilding':
+        S.shopBuilding = k === 'all' ? 'all' : k;
+        render();
+        break;
+      case 'newBuilding': buildingForm(); break;
+      case 'editBuilding': buildingForm(id); break;
+      case 'buildingDetail': openBuildingDetail(id); break;
+      case 'buildingShops':
+        S.shopTab = 'shops';
+        S.shopBuilding = k || 'all';
+        S.shopStatus = 'all';
+        closeModal();
+        render();
+        break;
+      case 'buildingShop': {
+        const bs = (S.data.shops || []).find(x => x.id === Number(id));
+        closeModal();
+        S.shopTab = 'shops';
+        S.shopBuilding = bs ? (String(bs.building || '').trim() || 'all') : 'all';
+        S.shopStatus = 'all';
+        render();
+        openShopDetail(id);
+        break;
+      }
+      case 'quickCreateBuildings': await quickCreateBuildings(); break;
+      case 'delBuilding': {
+        const db = buildingRows().find(x => x.id === Number(id));
+        if (!db) break;
+        const used = buildingStats(db.name).total;
+        confirmAsk('删除楼栋', `确定删除楼栋「${esc(db.name)}」？${used
+          ? `<br><br><b style="color:var(--red)">该楼栋下还有 ${used} 间商铺，需先在商铺中改到其他楼栋。</b>`
+          : '<br><br>删除后该楼栋的图纸 / 资料附件也会一并清理。'}`,
+          async () => {
+            await api('/buildings/' + id, { method: 'DELETE' });
+            toast('楼栋已删除');
+            await refresh();
+          });
+        break;
+      }
+      case 'mode':
+        setMode(btn.dataset.view, btn.dataset.mode);
+        render();
+        break;
+      case 'eqCat': S.eqCat = k; render(); break;
+      case 'contractStatus': S.contractStatus = k; render(); break;
+      case 'payFilter': S.payFilter = k; render(); break;
+
+      // 可视化驾驶舱：分析维度 / 时间范围 / 楼栋 / 下钻 / KPI 跳转
+      case 'dashTab': {
+        S.cockpitTab = COCKPIT_TABS.some(x => x.k === k) ? k : 'overview';
+        S.dashDrill = null;
+        render();
+        const tabs = document.getElementById('dashTabs');
+        if (tabs && typeof tabs.scrollIntoView === 'function') tabs.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        break;
+      }
+      case 'dashRange': S.dashRange = k; S.dashDrill = null; render(); break;
+      case 'dashBuilding': S.dashBuilding = k || 'all'; S.dashDrill = null; render(); break;
+      case 'dashDrill': setDashDrill(btn.dataset.type, btn.dataset.k); break;
+      case 'dashClear': S.dashDrill = null; render(); break;
+      case 'dashGo': dashGo(btn.dataset.view, btn.dataset.filter); break;
+      // 资产结构四类目与商铺管理统计栏同源：点击即下钻对应明细，并预置筛选
+      case 'dashCat': {
+        const cat = k || 'all';
+        if (['rented', 'vacant', 'maintenance', 'arrears'].includes(cat)) S.shopStatus = cat;
+        const label = { rented: '在租', vacant: '空置', maintenance: '维修' }[cat] || '';
+        setDashDrill(cat === 'arrears' ? 'arrears' : 'shopStatus', label);
+        break;
+      }
+
+      case 'export': exportExcel(S.view); break;
+      case 'exportAll': exportExcel('all', {}); break;
+      case 'exportOne': exportExcel(btn.dataset.module, { id }); break;
+      case 'printShop': printShop(id); break;
+      case 'printEq': printEq(id); break;
+
+      case 'shop': openShopDetail(id); break;
+      case 'newShop': shopForm(); break;
+      case 'editShop': shopForm(id); break;
+      case 'delShop': {
+        const s = S.data.shops.find(x => x.id === Number(id));
+        if (!s) break;
+        confirmAsk('删除商铺', `确定删除「${esc(s.name)}」？其抄表与账单记录也会一并删除，且不可恢复。`, async () => {
+          await api('/shops/' + id, { method: 'DELETE' });
+          toast('商铺已删除');
+          await refresh();
+        });
+        break;
+      }
+      case 'addShopWork': openShopWorkForm(id, btn.dataset.type); break;
+      case 'editShopWork': openShopWorkStatusForm(id, btn.dataset.type); break;
+      case 'editShopWorkLog': openShopWorkForm(null, null, id); break;
+      case 'delShopWorkLog': deleteShopWorkLog(id); break;
+      case 'addReading': openReadingForm(id); break;
+      case 'genBill': openBillForm(id); break;
+      case 'payBill': payBill(id); break;
+      case 'editReading': openReadingForm(null, id); break;
+      case 'delReading': deleteReading(id); break;
+      case 'editBill': openBillForm(null, id); break;
+      case 'delBill': deleteBill(id); break;
+
+      case 'newEq': eqForm(); break;
+      case 'editEq': eqForm(id); break;
+      case 'eq': openEqDetail(id); break;
+      case 'delEq': {
+        const eq = S.data.equipments.find(x => x.id === Number(id));
+        if (!eq) break;
+        confirmAsk('删除设备', `确定删除「${esc(eq.name)}」？其巡检维修记录也会一并删除。`, async () => {
+          await api('/equipments/' + id, { method: 'DELETE' });
+          toast('设备已删除');
+          await refresh();
+        });
+        break;
+      }
+      case 'addEqLog': openEqLogForm(id); break;
+      case 'editEqLog': openEqLogForm(null, id); break;
+      case 'delEqLog': deleteEqLog(id); break;
+      case 'editEqMaintain': openEqMaintainForm(id); break;
+      case 'eqMaintainFilter': S.eqMaintain = k; render(); break;
+
+      case 'newContract': contractForm(); break;
+      case 'editContract': contractForm(id); break;
+      case 'contract': openContractDetail(id); break;
+      case 'delContract': {
+        const c = S.data.contracts.find(x => x.id === Number(id));
+        if (!c) break;
+        confirmAsk('删除合同', `确定删除「${esc(c.name)}」？其付款计划、付款流水与施工进度记录都会一并删除。`, async () => {
+          await api('/contracts/' + id, { method: 'DELETE' });
+          toast('合同已删除');
+          await refresh();
+        });
+        break;
+      }
+      case 'addProgress': openProgressForm(id); break;
+      case 'addPlan': openPlanForm(id); break;
+      case 'payPlan': openPayForm(id); break;
+      case 'editPlan': openPlanForm(btn.dataset.contract, id); break;
+      case 'planBuilder': openPlanBuilder(id); break;
+      case 'planBuilderNew': openPlanBuilder(null); break;
+      case 'planAdd': case 'planDel': case 'planUp': case 'planDown':
+      case 'planTpl': case 'planEven': case 'planClear': {
+        if (!S.planDraft) break;
+        const ri = btn.dataset.row != null ? Number(btn.dataset.row) : null;
+        planDraftAction(S.planDraft, act, ri, k);
+        renderPlanBuilder(true);
+        break;
+      }
+      case 'planSave': await savePlanBuilder(); break;
+
+      // 档案管理（1.18.0）
+      case 'archiveCat': S.archiveCat = k; render(); break;
+      case 'archiveStatus': S.archiveStatus = k; render(); break;
+      case 'newArchive': archiveForm(); break;
+      case 'editArchive': archiveForm(id); break;
+      case 'archive': openArchiveDetail(id); break;
+      case 'delArchive': {
+        const ar = archiveAll().find(x => x.id === Number(id));
+        if (!ar) break;
+        confirmAsk('删除档案', `确定删除「${esc(ar.title)}」？其借阅记录与扫描件索引也会一并删除，且不可恢复。`, async () => {
+          await api('/archives/' + id, { method: 'DELETE' });
+          toast('档案已删除');
+          await refresh();
+        });
+        break;
+      }
+      case 'addArchiveLog': openArchiveLogForm(id, btn.dataset.type); break;
+      case 'editArchiveLog': openArchiveLogForm(null, null, id); break;
+      case 'delArchiveLog': deleteArchiveLog(id); break;
+      case 'printArchive': printArchive(id); break;
+
+      // 仓库管理（1.18.0）
+      case 'whCat': S.warehouseCat = k; render(); break;
+      case 'whFilter': S.warehouseFilter = k; render(); break;
+      case 'newWhItem': whForm(); break;
+      case 'editWhItem': whForm(id); break;
+      case 'whItem': openWhDetail(id); break;
+      case 'delWhItem': {
+        const wi = whAll().find(x => x.id === Number(id));
+        if (!wi) break;
+        confirmAsk('删除物料', `确定删除「${esc(wi.name)}」？其全部出入库流水与附件索引也会一并删除，且不可恢复。`, async () => {
+          await api('/warehouse_items/' + id, { method: 'DELETE' });
+          toast('物料已删除');
+          await refresh();
+        });
+        break;
+      }
+      case 'addWhRecord': openWhRecordForm(id, btn.dataset.type); break;
+      case 'editWhRecord': openWhRecordForm(null, null, id); break;
+      case 'delWhRecord': deleteWhRecord(id); break;
+      case 'printWhItem': printWhItem(id); break;
+
+      case 'viewAtt': openAttPreview(id); break;
+      case 'delAtt': deleteAttachment(id); break;
+      case 'attList': openAttList(btn.dataset.entity, id); break;
+    }
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+});
+
+let searchTimer = null;
+/* 各模块搜索框 → S 中对应的关键词字段，统一防抖渲染并保留光标位置 */
+const SEARCH_BINDINGS = {
+  shopSearch: 'shopQuery',
+  eqSearch: 'eqQuery',
+  contractSearch: 'contractQuery',
+  paySearch: 'payQuery',
+  archiveSearch: 'archiveQuery',
+  whSearch: 'warehouseQuery'
+};
+document.addEventListener('input', (e) => {
+  // 自定义付款计划编辑器：字段联动（金额 ⇄ 比例），输入时不重绘表格以免丢失焦点
+  const pk = e.target.getAttribute && e.target.getAttribute('data-pk');
+  if (pk && S.planDraft) {
+    const ri = Number(e.target.dataset && e.target.dataset.row);
+    const sync = planDraftEdit(S.planDraft, ri, pk, e.target.value);
+    if (sync) {
+      const other = document.querySelector(`[data-pk="${sync.k}"][data-row="${ri}"]`);
+      if (other) other.value = sync.v;
+    }
+    const sum = $('#pbSummary');
+    if (sum) sum.innerHTML = planSummaryHtml(S.planDraft);
+    return;
+  }
+  const sq = SEARCH_BINDINGS[e.target.id];
+  if (sq) {
+    S[sq] = e.target.value;
+    const inputId = e.target.id, pos = e.target.selectionStart;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      render();
+      const el = $('#' + inputId);
+      if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (err) {} }
+    }, 180);
+  }
+  if (e.target.id === 'auditSearch') {
+    S.auditQ.q = e.target.value;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(async () => {
+      const pos = e.target.selectionStart;
+      await loadAudit();
+      const el = $('#auditSearch');
+      if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (err) {} }
+    }, 250);
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    // 1.20.0：ESC 不关闭任何弹窗，只提示明确的关闭入口
+    if ($('#lightRoot').innerHTML || $('#modalRoot').innerHTML)
+      toast('请点击「关闭」按钮或右上角 × 关闭弹窗', 'warn');
+    // 1.25.0：没有弹窗时，ESC 可收起移动端导航抽屉（与弹窗规则互不干扰）
+    else if (S.navOpen) closeNav();
+  }
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && S.formSubmit) S.formSubmit();
+});
+
+/* 附件上传：拿到文件后立即上传，不需要提交表单 */
+document.addEventListener('change', (e) => {
+  // 自定义付款计划编辑器：下拉框 / 日期框
+  const pk = e.target.getAttribute && e.target.getAttribute('data-pk');
+  if (pk && S.planDraft) {
+    planDraftEdit(S.planDraft, Number(e.target.dataset && e.target.dataset.row), pk, e.target.value);
+    return;
+  }
+  const filter = e.target.closest && e.target.closest('[data-audit-filter]');
+  if (filter) { S.auditQ[filter.dataset.auditFilter] = filter.value; loadAudit(); return; }
+  const inp = e.target.closest('[data-attach-input]');
+  if (!inp) return;
+  const panel = inp.closest('[data-entity]');
+  if (!panel) return;
+  const eid = Number(panel.dataset.eid) || 0;
+  if (!eid) { toast('请先保存记录，再上传附件', 'err'); return; }
+  uploadAttachments(panel.dataset.entity, eid, inp.files, inp);
+});
+
+/* 启动 */
+load();
